@@ -1,0 +1,4105 @@
+---
+title: "Seurat vignette"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+# Load functions
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library("RColorBrewer")
+library(ggpubr)
+library(vegan)
+library(cowplot)
+library(harmony)
+library(fgsea)
+library(msigdbr)
+library(caret)
+library(pROC)
+library(h2o) # machine learning
+library(umap)
+library(irlba) # for fast pca
+library(vegan) # distance function
+library(preprocessCore) # for quantile normalization
+library(openxlsx)
+library(rstatix)
+sessionInfo()
+```
+
+```{r}
+PlotGeneExpSpatial <- function(
+    seurat_object, slot = "counts", gene
+    ){
+  g_exp <- GetAssayData(seurat_object, slot = "counts", assay = "SCT")[rownames(seurat_object) == gene, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  # TMA1
+  p1_label <- SpatialPlot(
+    seurat_object, label = T,
+    slot = slot, group.by = "Sample",
+    images = "TMA1", label.box = FALSE)
+  p1_label <- ggplot_build(p1_label)$data[[2]]
+  p1 <- SpatialPlot(
+    seurat_object,# crop = FALSE,
+    slot = slot, features = gene, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(95),
+      values=seq(0, 1, length.out=100), limits=r
+    ) + 
+    annotate(
+      "text", x = p1_label$x, y = p1_label$y - 52,
+      label = p1_label$label,# color = "grey",
+      size = 5, fontface = "bold"
+    )
+  # TMA2
+  p2_label <- SpatialPlot(
+    seurat_object, label = T,
+    slot = slot, group.by = "Sample", images = "TMA2", label.box = FALSE)
+  p2_label <- ggplot_build(p2_label)$data[[2]]
+  p2 <- SpatialPlot(
+    seurat_object,# crop = FALSE, 
+    slot = slot, features = gene, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    ) + 
+    annotate(
+      "text", x = p2_label$x - 20, y = p2_label$y - 55,
+      label = p2_label$label,# color = "grey",
+      size = 5, fontface = "bold"
+    )
+  # TMA3
+  p3_label <- SpatialPlot(
+    seurat_object, label = T,
+    slot = slot, group.by = "Sample", images = "TMA3", label.box = FALSE)
+  p3_label <- ggplot_build(p3_label)$data[[2]]
+  p3 <- SpatialPlot(
+    seurat_object,# crop = FALSE,
+    slot = slot, features = gene, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    ) + 
+    annotate(
+      "text", x = p3_label$x - 20, y = p3_label$y - 57,
+      label = p3_label$label,# color = "grey",
+      size = 5, fontface = "bold"
+    )
+  # TMA4
+  p4_label <- SpatialPlot(
+    seurat_object, label = T,
+    slot = slot, group.by = "Sample", images = "TMA4", label.box = FALSE)
+  p4_label <- ggplot_build(p4_label)$data[[2]]
+  p4 <- SpatialPlot(
+    seurat_object,# crop = FALSE,
+    slot = slot, features = gene, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    ) + 
+    annotate(
+      "text", x = p4_label$x, y = p4_label$y + 68,
+      label = p4_label$label,# color = "aquamarine3",
+      size = 5, fontface = "bold")
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  return(figure)
+}
+
+# figure <- PlotGeneExpSpatial(seurat_object, gene = "KRT7")
+# ggsave(paste0(sub_output_dir, "KRT7", "_raw_count.png"), figure, height = 7, width = 21, dpi = 200)
+```
+
+# Load data
+
+```{r}
+Blue <- rgb(0, 114, 178, maxColorValue = 255) # Long PFI HC
+SkyBlue <- rgb(86, 180, 233, maxColorValue = 255) # Long PFI BG
+Orange <- rgb(230, 159, 0, maxColorValue = 255) # Short PFI HC
+Yellow <- rgb(240, 228, 6, maxColorValue = 255) # Short PFI BG
+Vermillion <- rgb(213, 94, 0, maxColorValue = 255) # Benign
+
+output_dir <- "../data/output/"
+if (!dir.exists(output_dir)){
+  dir.create(output_dir)
+}
+```
+
+```{r}
+data_exp <- Read10X_h5("../data/raw/AGG_OvST_Batch1_251121/filtered_feature_bc_matrix.h5")
+data_exp <- CreateSeuratObject(data_exp, assay = "Spatial")
+```
+
+## Load images separately
+
+```{r}
+samples <- c("HC-TMA1", "HC-TMA2", "HC-TMA3", "HC-TMA4")
+
+image <- NULL
+for (s in samples) {
+  s_modified <- gsub("HC-", "", s)
+  tmp <- Load10X_Spatial(paste0("../data/raw/cellranger_outs/", s, "/"), slice = s_modified)
+  ann <- read.csv(paste0("../data/raw/sample_information/", s, "_sample_cell_table.csv"))
+  sampleMeta <- ann$sample
+  names(sampleMeta) <- ann$Barcode
+  tmp <- AddMetaData(tmp, sampleMeta, col.name = "Sample")
+  tmp$plate <- s_modified
+  if (!is.null(image)){
+    tmp <- RenameCells(
+      tmp,
+      new.names = paste0(str_sub(colnames(tmp),1, -2), str_sub(s_modified, -1))
+    )
+    image <- merge(image, tmp)
+    VariableFeatures(image) <- unique(c(VariableFeatures(image), VariableFeatures(tmp)))
+  } else {
+    image <- tmp
+  }
+}
+```
+
+```{r}
+data <- image
+data@assays$Spatial <- data_exp@assays$Spatial
+```
+
+```{r}
+SpatialFeaturePlot(data, features = "nCount_Spatial") + theme(legend.position = "right")
+```
+
+# Add sample information
+
+```{r}
+# Confidence
+confMeta <- rep("Benign", length(data$Sample))
+confMeta[startsWith(data$Sample, "HC")] <- "High confidence"
+confMeta[startsWith(data$Sample, "BG")] <- "Background"
+names(confMeta) <- names(data$Sample)
+data <- AddMetaData(data, confMeta, col.name = "Confidence")
+
+# PFI
+pfiMeta <- rep("Benign", length(data$Sample))
+pfiMeta[startsWith(data$Sample, "BG-L") | startsWith(data$Sample, "HC-L")] <- "Long"
+pfiMeta[startsWith(data$Sample, "BG-S") | startsWith(data$Sample, "HC-S")] <- "Short"
+names(pfiMeta) <- names(data$Sample)
+data <- AddMetaData(data, pfiMeta, col.name = "PFI")
+
+# Patient code
+data$patient <- gsub(".*_", "", data$Sample)
+
+# Confidence + PFI group
+data$PFI_confidence <- paste0(data$PFI, " PFI ", tolower(data$Confidence))
+data$PFI_confidence[data$PFI_confidence == "Benign PFI benign"] <- "Benign"
+data$PFI_confidence <- factor(
+  data$PFI_confidence,
+  levels = c(
+    "Long PFI high confidence",
+    "Long PFI background",
+    "Short PFI high confidence",
+    "Short PFI background",
+    "Benign"))
+```
+
+# Add cell type
+
+```{r}
+anno_manual <- read.csv("../data/raw/transfer_173888_files_1a992c4a/Tissue types_March30_Epi_Stroma.csv")
+meta <- anno_manual$Tissue.type
+names(meta) <- anno_manual$Barcode
+data <- AddMetaData(data, metadata = meta, col.name = "annotation_manual")
+```
+
+```{r}
+# ucell <- read.csv("../data/output/cell_type/UCell/UCell_type.csv")
+# data@meta.data <- data@meta.data %>% 
+#   cbind.data.frame(select(ucell, -cell_id))
+```
+
+# Figure2. Dimensionality reduction, clustering and visualization
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "data", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+sub_output_dir <- "../data/output/Figure2/"
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+data <- SCTransform(data, assay = "Spatial")
+# data <- ScaleData(data, assay = "SCT", vars.to.regress = "patient")
+data <- RunPCA(data, assay = "SCT", verbose = FALSE)
+data <- FindNeighbors(data, assay = "SCT", reduction = "pca", dims = 1:20)
+data <- FindClusters(data, assay = "SCT", verbose = FALSE)
+data <- RunUMAP(data, assay = "SCT", reduction = "pca", dims = 1:20)
+```
+
+```{r}
+UMAPPlot(data)
+ggsave(paste0(sub_output_dir, "group_seurat_cluster.png"))
+```
+
+```{r}
+UMAPPlot(data, group.by = "patient")
+ggsave(paste0(sub_output_dir, "group_patient.png"))
+UMAPPlot(data, group.by = "patient", label = TRUE)
+ggsave(paste0(sub_output_dir, "group_patient_with_label.png"))
+```
+
+```{r}
+UMAPPlot(data, group.by = "PFI_confidence", cols = c(Blue, SkyBlue, Orange, Yellow, Vermillion)) +
+  labs(x = "UMAP 1",
+       y = "UMAP 2",
+       title = "") +
+  theme(legend.position = "right")
+ggsave(paste0(sub_output_dir, "group_PFI_confidence.pdf"), width = 5.2, height = 3)
+```
+
+```{r}
+DimPlot(
+  subset(data, cells = colnames(data)[data$Confidence != "Benign"]), 
+  reduction = "umap",
+  group.by = "PFI_confidence",
+  split.by = "Confidence",
+  cols = c(Blue, SkyBlue, Orange, Yellow, Vermillion)) +
+  labs(x = "UMAP 1",
+       y = "UMAP 2",
+       title = "")
+ggsave(paste0(sub_output_dir, "group_PFI_confidence_split_by_confidence.pdf"), width = 7, height = 3.2)
+```
+
+```{r}
+saveRDS(data, "../data/output/merged_samples.RDS")
+```
+
+## Figure 2b Harmony
+
+```{r}
+set.seed(1234)
+data_harm <- RunHarmony(data, "patient", plot_convergence = TRUE)
+```
+
+```{r}
+data_harm <- data_harm %>% 
+    RunUMAP(reduction = "harmony", dims = 1:20) %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:20) %>% 
+    FindClusters(resolution = 0.5) %>% 
+    identity()
+```
+
+```{r}
+saveRDS(data_harm, "../data/output/merged_samples_harmony.RDS")
+```
+
+```{r}
+DimPlot(data_harm, reduction = "umap", group.by = "patient") +
+  labs(x = "UMAP 1",
+       y = "UMAP 2",
+       title = "")
+ggsave(paste0(sub_output_dir, "UMAP_after_harmony.png"), width = 5, height = 3)
+```
+
+```{r}
+DimPlot(data_harm, reduction = "umap", group.by = "PFI_confidence", cols = c(Blue, SkyBlue, Orange, Yellow, Vermillion)) +
+  labs(x = "UMAP 1",
+       y = "UMAP 2",
+       title = "")
+ggsave(paste0(sub_output_dir, "UMAP_after_harmony_PFI_confidence.pdf"), width = 5.2, height = 3)
+```
+
+```{r}
+DimPlot(
+  subset(data_harm, cells = colnames(data_harm)[data_harm$Confidence != "Benign"]), 
+  reduction = "umap",
+  group.by = "PFI_confidence",
+  split.by = "Confidence",
+  cols = c(Blue, SkyBlue, Orange, Yellow, Vermillion)) +
+  labs(x = "UMAP 1",
+       y = "UMAP 2",
+       title = "")
+ggsave(paste0(sub_output_dir, "UMAP_after_harmony_PFI_confidence_split_by_confidence.pdf"), width = 7, height = 3.2)
+```
+
+## Figure 2c Distance before harmony
+
+```{r}
+data2 = Embeddings(data, 'umap')
+# data2 = data@assays$SCT@data # scale data or data or count? data contains technical artifact, scale data may be more biologicall relevant
+
+data2 = data.frame(data2)
+dim(data2)
+
+# quantile normalization
+# data2 = normalize.quantiles(as.matrix(data2))
+
+group1 = ifelse(str_detect(data$Sample, "marker"), "benign","cancer") # cancer or benign?
+group2 = ifelse(str_detect(data$Sample, "BG"), "BG", "HC") # BG or HC?
+group2[which(group1 == "benign")] = "benign"
+group3 = ifelse(str_detect(data$Sample, "S_"), "S", "L") # S or L?
+group3[which(group1 == "benign")] = "benign"
+group4 = unlist(lapply(data$Sample, function(x) strsplit(x, "_")[[1]][2])) # patient id
+
+index1 = which(group2 == "HC")
+index2 = which(group2 == "BG")
+
+# simple analysis - HC cells between S and L patients have higher distance than BG cells
+data2.dist = vegdist(data2, method = "euclidean") # vegan library
+data2.dist = as.matrix(data2.dist) # pairwise distance of all cells in the umap
+
+# randomly take N cells in each patient group (L or S)
+N = 1000
+I = 1000
+res = mat.or.vec(I, 3)
+set.seed(123)
+for(i in 1:I){
+  cat("\r", i)
+  index.L = sample(which(group3 == "L"), N)
+  index.S = sample(which(group3 == "S"), N)
+  # check how many are HC
+  index.L.HC = index.L[which(group2[index.L] == "HC")] # HC cells for L 
+  index.S.HC = index.S[which(group2[index.S] == "HC")] # HC cells for S
+  
+  index.L.BG = setdiff(index.L, index.L.HC) # BG cells for L
+  index.S.BG = setdiff(index.S, index.S.HC) # BG cells for S
+  
+  # HC cells
+  # within group distance
+  dist1 = data2.dist[index.L.HC,index.L.HC]
+  dist2 = data2.dist[index.S.HC,index.S.HC]
+  
+  # between group distance
+  dist3 = data2.dist[index.L.HC,index.S.HC]
+  dist4 = data2.dist[index.S.HC,index.L.HC]
+  
+  # t.test(c(dist1,dist2), c(dist3,dist4)) # should be significant
+  
+  # BG cells
+  # within group distance
+  dist5 = data2.dist[index.L.BG,index.L.BG]
+  dist6 = data2.dist[index.S.BG,index.S.BG]
+  
+  # between group distance
+  dist7 = data2.dist[index.L.BG,index.S.BG]
+  dist8 = data2.dist[index.S.BG,index.L.BG]
+  
+  # t.test(c(dist5,dist6), c(dist7,dist8)) # most likely also significant
+  
+  # L/S cells within group distance
+  dist9 = data2.dist[index.L,index.L]
+  dist10 = data2.dist[index.S,index.S]
+  
+  # between group distance
+  dist11 = data2.dist[index.L,index.S]
+  dist12 = data2.dist[index.S,index.L]
+  
+  # t.test(c(dist9,dist10), c(dist11,dist12)) # most likely also significant
+  
+  
+  # HC cells vs BG cells
+  res[i, 1] = mean(c(dist3, dist4)) - mean(c(dist1, dist2))
+  res[i, 2] = mean(c(dist7, dist8)) - mean(c(dist5, dist6))
+  res[i, 3] = mean(c(dist11, dist12)) - mean(c(dist9, dist10))
+}
+
+t.test(res[,1], alternative = "greater") # between-group HC cells are more distanced than within-group HC cells
+t.test(res[,2], alternative = "greater") # between-group BC cells are more distanced than within-group BC cells
+t.test(res[,3], alternative = "greater") # between-group cells are more distanced than within-group cells
+t.test(res[,1], res[,2], alternative = "greater") # HC cells separate L/S better than BG cells
+
+delta = c(res[,1], res[,2])
+group = c(rep("High confidence", 1000), rep("Background", 1000))
+```
+
+Violin plot
+
+```{r}
+res.plot = data.frame(delta = delta, group = group)
+
+# ggplot(res.plot, aes(x = group, y = delta, color = group)) +
+#   geom_violin(trim = FALSE) +
+#   scale_color_manual(values = c("SkyBlue", "Blue")) +
+#   geom_jitter(position = position_jitter(0.2)) +
+#   labs(
+#     y = "Intergroup distance - intragroup distance",
+#     x = "") +
+#   theme(legend.position = "none")
+
+test <- t.test(
+  res.plot$delta[res.plot$group == "High confidence"],
+  res.plot$delta[res.plot$group == "Background"])
+print(test)
+
+ggplot(data = res.plot, aes(x = group, y = delta, fill = group)) +
+  geom_violin(trim = FALSE) + 
+  labs(
+    y = bquote(Dist[inter] - Dist[intra]),
+    x = ""
+  ) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) + 
+  # geom_segment(aes(y = cutoff, x = 1.75, xend = 2.25, yend = 14.93)) + 
+  scale_fill_manual(values=c(SkyBlue, Blue)) +
+  theme_classic() + 
+  theme(
+    legend.position = "none",
+    text = element_text(size = 15),
+    axis.text = element_text(color = "black")
+  ) +
+  annotate(
+    geom = "text",
+    x = 1.5,
+    y = 3.3,
+    size = 5,
+    label = ifelse(
+      test$p.value == 0,
+      "P < 2.2E-16",
+      paste0("t test, P = ", signif(test$p.value, 2))
+    ))
+ggsave(paste0(sub_output_dir, "intra_inter_group_distances.pdf"), width = 4, height = 2.8)
+```
+
+## Figure 2d Distance after harmony
+
+```{r}
+data2 = Embeddings(data_harm, 'umap')
+# data2 = data@assays$SCT@data # scale data or data or count? data contains technical artifact, scale data may be more biologicall relevant
+
+data2 = data.frame(data2)
+dim(data2)
+
+# quantile normalization
+# data2 = normalize.quantiles(as.matrix(data2))
+
+group1 = ifelse(str_detect(data$Sample, "marker"), "benign","cancer") # cancer or benign?
+group2 = ifelse(str_detect(data$Sample, "BG"), "BG", "HC") # BG or HC?
+group2[which(group1 == "benign")] = "benign"
+group3 = ifelse(str_detect(data$Sample, "S_"), "S", "L") # S or L?
+group3[which(group1 == "benign")] = "benign"
+group4 = unlist(lapply(data$Sample, function(x) strsplit(x, "_")[[1]][2])) # patient id
+
+index1 = which(group2 == "HC")
+index2 = which(group2 == "BG")
+
+# simple analysis - HC cells between S and L patients have higher distance than BG cells
+data2.dist = vegdist(data2, method = "euclidean") # vegan library
+data2.dist = as.matrix(data2.dist) # pairwise distance of all cells in the umap
+
+# randomly take N cells in each patient group (L or S)
+N = 1000
+I = 1000
+res = mat.or.vec(I, 3)
+set.seed(123)
+for(i in 1:I){
+  cat("\r", i)
+  index.L = sample(which(group3 == "L"), N)
+  index.S = sample(which(group3 == "S"), N)
+  # check how many are HC
+  index.L.HC = index.L[which(group2[index.L] == "HC")] # HC cells for L 
+  index.S.HC = index.S[which(group2[index.S] == "HC")] # HC cells for S
+  
+  index.L.BG = setdiff(index.L, index.L.HC) # BG cells for L
+  index.S.BG = setdiff(index.S, index.S.HC) # BG cells for S
+  
+  # HC cells
+  # within group distance
+  dist1 = data2.dist[index.L.HC,index.L.HC]
+  dist2 = data2.dist[index.S.HC,index.S.HC]
+  
+  # between group distance
+  dist3 = data2.dist[index.L.HC,index.S.HC]
+  dist4 = data2.dist[index.S.HC,index.L.HC]
+  
+  # t.test(c(dist1,dist2), c(dist3,dist4)) # should be significant
+  
+  # BG cells
+  # within group distance
+  dist5 = data2.dist[index.L.BG,index.L.BG]
+  dist6 = data2.dist[index.S.BG,index.S.BG]
+  
+  # between group distance
+  dist7 = data2.dist[index.L.BG,index.S.BG]
+  dist8 = data2.dist[index.S.BG,index.L.BG]
+  
+  # t.test(c(dist5,dist6), c(dist7,dist8)) # most likely also significant
+  
+  # L/S cells within group distance
+  dist9 = data2.dist[index.L,index.L]
+  dist10 = data2.dist[index.S,index.S]
+  
+  # between group distance
+  dist11 = data2.dist[index.L,index.S]
+  dist12 = data2.dist[index.S,index.L]
+  
+  # t.test(c(dist9,dist10), c(dist11,dist12)) # most likely also significant
+  
+  
+  # HC cells vs BG cells
+  res[i, 1] = mean(c(dist3, dist4)) - mean(c(dist1, dist2))
+  res[i, 2] = mean(c(dist7, dist8)) - mean(c(dist5, dist6))
+  res[i, 3] = mean(c(dist11, dist12)) - mean(c(dist9, dist10))
+}
+
+t.test(res[,1], alternative = "greater") # between-group HC cells are more distanced than within-group HC cells
+t.test(res[,2], alternative = "greater") # between-group BC cells are more distanced than within-group BC cells
+t.test(res[,3], alternative = "greater") # between-group cells are more distanced than within-group cells
+t.test(res[,1], res[,2], alternative = "greater") # HC cells separate L/S better than BG cells
+
+delta = c(res[,1], res[,2])
+group = c(rep("High confidence", 1000), rep("Background", 1000))
+```
+
+Violin plot
+
+```{r}
+res.plot = data.frame(delta = delta, group = group)
+
+# ggplot(res.plot, aes(x = group, y = delta, color = group)) +
+#   geom_violin(trim = FALSE) +
+#   scale_color_manual(values = c("SkyBlue", "Blue")) +
+#   geom_jitter(position = position_jitter(0.2)) +
+#   labs(
+#     y = "Intergroup distance - intragroup distance",
+#     x = "") +
+#   theme(legend.position = "none")
+
+test <- t.test(
+  res.plot$delta[res.plot$group == "High confidence"],
+  res.plot$delta[res.plot$group == "Background"])
+print(test)
+
+ggplot(data = res.plot, aes(x = group, y = delta, fill = group)) +
+  geom_violin(trim = FALSE) + 
+  labs(
+    y = bquote(Dist[inter] - Dist[intra]),
+    x = ""
+  ) +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) + 
+  # geom_segment(aes(y = cutoff, x = 1.75, xend = 2.25, yend = 14.93)) + 
+  scale_fill_manual(values=c(SkyBlue, Blue)) +
+  theme_classic() + 
+  theme(
+    text = element_text(size = 15),
+    legend.position = "none",
+    axis.text = element_text(color = "black")
+  ) +
+  annotate(
+    geom = "text",
+    x = 1.5,
+    y = 0.6,
+    size = 5,
+    label = ifelse(
+      test$p.value == 0,
+      "P < 2.2E-16",
+      paste0("t test, P = ", signif(test$p.value, 2))
+    ))
+ggsave(paste0(sub_output_dir, "intra_inter_group_distances_after_harmony.pdf"), width = 4, height = 2.8)
+```
+
+## Supplementary tablt 2 Number of spots per sample
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+table <- as.data.frame(table(data$Sample))
+colnames(table) <- c("Sample", "Number_of_spots")
+# table <- t(table)
+cell_per_spot <- read.xlsx("../data/raw/AvgCellsPerSpot_for_Shuyu.xlsx", sheet = 2)
+table <- left_join(table, cell_per_spot, by = c("Sample" = "sample")) %>% 
+  arrange(Sample) %>% 
+  rename(
+    "Number of spots" = Number_of_spots,
+    "Cell per spot" = cell_per_spot)
+write.csv(table, "../data/output/table_S2_number_of_spot_per_sample_and_cell_per_spot.csv", row.names = FALSE)
+```
+
+```{r}
+summary(table)
+```
+
+# DEG
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+
+output_dir <- "../data/output/DEG/"
+if (!dir.exists(output_dir)){
+  dir.create(output_dir)
+}
+```
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+```
+
+## short PFI vs long PFI in BG area
+
+```{r include=FALSE}
+Idents(data) <- "PFI"
+deg_BG <- FindMarkers(
+  subset(data, cells = colnames(data)[data$Confidence == "Background"]), 
+  ident.1 = "Short",
+  ident.2 = "Long",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_short <- rowMeans(data@assays$SCT@counts[, data$PFI == "Short" & data$Confidence == "Background"])
+mean_short <- data.frame(
+  gene = names(mean_short),
+  mean_exp_short_PFI = mean_short
+)
+mean_long <- rowMeans(data@assays$SCT@counts[, data$PFI == "Long" & data$Confidence == "Background"])
+mean_long <- data.frame(
+  gene = names(mean_long),
+  mean_exp_long_PFI = mean_long
+)
+
+deg_BG <- deg_BG %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_long, by = "gene") %>% 
+  left_join(mean_short, by = "gene")
+
+deg_BG$avg_log2FC_manual <- log2(deg_BG$mean_exp_short_PFI + 1)-log2(deg_BG$mean_exp_long_PFI + 1)
+
+write.csv(
+  deg_BG,
+  paste0(output_dir, "deg_short_vs_long_PFI_in_BG.csv"),
+  row.names = FALSE)
+```
+
+## short PFI vs long PFI in HC area
+
+```{r include=FALSE}
+Idents(data) <- "PFI"
+deg_HC <- FindMarkers(
+  subset(data, cells = colnames(data)[data$Confidence == "High confidence"]), 
+  ident.1 = "Short",
+  ident.2 = "Long",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_short <- rowMeans(data@assays$SCT@counts[, data$PFI == "Short" & data$Confidence == "High confidence"])
+mean_short <- data.frame(
+  gene = names(mean_short),
+  mean_exp_short_PFI = mean_short
+)
+mean_long <- rowMeans(data@assays$SCT@counts[, data$PFI == "Long" & data$Confidence == "High confidence"])
+mean_long <- data.frame(
+  gene = names(mean_long),
+  mean_exp_long_PFI = mean_long
+)
+
+deg_HC <- deg_HC %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_long, by = "gene") %>% 
+  left_join(mean_short, by = "gene")
+
+deg_HC$avg_log2FC_manual <- log2(deg_HC$mean_exp_short_PFI + 1)-log2(deg_HC$mean_exp_long_PFI + 1)
+
+write.csv(
+  deg_HC,
+  paste0(output_dir, "deg_short_vs_long_PFI_in_HC.csv"),
+  row.names = FALSE)
+```
+
+## HC vs BG in Long PFI
+
+```{r include=FALSE}
+Idents(data) <- "Confidence"
+deg_long <- FindMarkers(
+  subset(data, cells = colnames(data)[data$PFI == "Long"]), 
+  ident.1 = "High confidence",
+  ident.2 = "Background",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_high <- rowMeans(data@assays$SCT@counts[, data$PFI == "Long" & data$Confidence == "High confidence"])
+mean_high <- data.frame(
+  gene = names(mean_high),
+  mean_exp_HC = mean_high
+)
+mean_low <- rowMeans(data@assays$SCT@counts[, data$PFI == "Long" & data$Confidence == "Background"])
+mean_low <- data.frame(
+  gene = names(mean_low),
+  mean_exp_BC = mean_low
+)
+
+deg_long <- deg_long %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_low, by = "gene") %>% 
+  left_join(mean_high, by = "gene")
+
+deg_long$avg_log2FC_manual <- log2(deg_long$mean_exp_HC + 1)-log2(deg_long$mean_exp_BC + 1)
+
+write.csv(
+  deg_long,
+  paste0(output_dir, "deg_HC_vs_BG_in_long_PFI.csv"),
+  row.names = FALSE)
+```
+
+## HC vs BG in Short PFI
+
+```{r include=FALSE}
+Idents(data) <- "Confidence"
+deg_short <- FindMarkers(
+  subset(data, cells = colnames(data)[data$PFI == "Short"]), 
+  ident.1 = "High confidence",
+  ident.2 = "Background",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_high <- rowMeans(data@assays$SCT@counts[, data$PFI == "Short" & data$Confidence == "High confidence"])
+mean_high <- data.frame(
+  gene = names(mean_high),
+  mean_exp_HC = mean_high
+)
+mean_low <- rowMeans(data@assays$SCT@counts[, data$PFI == "Short" & data$Confidence == "Background"])
+mean_low <- data.frame(
+  gene = names(mean_low),
+  mean_exp_BG = mean_low
+)
+
+deg_short <- deg_short %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_low, by = "gene") %>% 
+  left_join(mean_high, by = "gene")
+
+deg_short$avg_log2FC_manual <- log2(deg_short$mean_exp_HC + 1)-log2(deg_short$mean_exp_BG + 1)
+
+write.csv(
+  deg_short,
+  paste0(output_dir, "deg_HC_vs_BG_in_short_PFI.csv"),
+  row.names = FALSE)
+```
+
+## pseudo-bulk data across patient cells
+
+```{r}
+exp_matrix <- data@assays$SCT@data
+exp_count <- data@assays$SCT@counts
+samples <- unique(data@meta.data$Sample)
+
+sample_exp_matrix <- data.frame(
+  gene = rownames(exp_matrix)
+)
+sample_exp_count <- data.frame(
+  gene = rownames(exp_count)
+)
+for (s in samples){
+  tmp <- rowMeans(exp_matrix[, colnames(exp_matrix)[data@meta.data$Sample == s]])
+  sample_exp_matrix[[s]] <- tmp
+  tmp <- rowMeans(exp_count[, colnames(exp_count)[data@meta.data$Sample == s]])
+  sample_exp_count[[s]] <- tmp
+}
+```
+
+### t test on short PFI vs long PFI in HC area
+
+```{r include=FALSE}
+short <- grepl("HC-S", colnames(sample_exp_matrix))
+long <- grepl("HC-L", colnames(sample_exp_matrix))
+test_result <- NULL
+
+for (i in 1:nrow(sample_exp_matrix)) {
+  t <- t.test(sample_exp_matrix[i, short], sample_exp_matrix[i, long])
+  mean_count_short_PFI_sample_level <- mean(unlist(sample_exp_count[i, short]))
+  mean_count_long_PFI_sample_level <- mean(unlist(sample_exp_count[i, long]))
+  df <- data.frame(
+    gene = sample_exp_matrix$gene[i],
+    p_value_sample_level = t$p.value,
+    mean_count_short_PFI_sample_level = mean_count_short_PFI_sample_level,
+    mean_count_long_PFI_sample_level = mean_count_long_PFI_sample_level
+  )
+  test_result <- rbind.data.frame(test_result, df)
+}
+```
+
+```{r}
+deg_HC <- deg_HC %>% 
+  left_join(test_result, by = "gene")
+```
+
+```{r}
+write.csv(
+  deg_HC,
+  paste0(output_dir, "deg_short_vs_long_PFI_in_HC_add_sample_level_t_test.csv"),
+  row.names = FALSE)
+```
+
+### t test on short PFI vs long PFI in BG area
+
+```{r include=FALSE}
+short <- grepl("BG-S", colnames(sample_exp_matrix))
+long <- grepl("BG-L", colnames(sample_exp_matrix))
+test_result <- NULL
+for (i in 1:nrow(sample_exp_matrix)) {
+  t <- t.test(sample_exp_matrix[i, short], sample_exp_matrix[i, long])
+  mean_count_short_PFI_sample_level <- mean(unlist(sample_exp_count[i, short]))
+  mean_count_long_PFI_sample_level <- mean(unlist(sample_exp_count[i, long]))
+  df <- data.frame(
+    gene = sample_exp_matrix$gene[i],
+    p_value_sample_level = t$p.value,
+    mean_count_short_PFI_sample_level = mean_count_short_PFI_sample_level,
+    mean_count_long_PFI_sample_level = mean_count_long_PFI_sample_level
+  )
+  test_result <- rbind.data.frame(test_result, df)
+}
+```
+
+```{r}
+deg_BG <- deg_BG %>% 
+  left_join(test_result, by = "gene")
+```
+
+```{r}
+write.csv(
+  deg_BG,
+  paste0(output_dir, "deg_short_vs_long_PFI_in_BG_add_sample_level_t_test.csv"),
+  row.names = FALSE
+)
+```
+
+# Merge DEG lists
+
+## In whole sample
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+sub_output_dir <- paste0(output_dir, "merge_filter_DEGs/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+deg_HC <- read.csv("../data/output/DEG/deg_short_vs_long_PFI_in_HC_add_sample_level_t_test.csv") %>% 
+  select(-X)
+names(deg_HC)[-1] <- paste0(names(deg_HC)[-1], "_HC")
+deg_BG <- read.csv("../data/output/DEG/deg_short_vs_long_PFI_in_BG_add_sample_level_t_test.csv") %>% 
+  select(-X)
+names(deg_BG)[-1] <- paste0(names(deg_BG)[-1], "_BG")
+
+deg_HC_BG <- deg_HC %>% 
+  full_join(deg_BG, by = "gene") %>% 
+  mutate(conflict = sign(avg_log2FC_manual_HC) != sign(avg_log2FC_manual_BG))
+
+sig_gene_in_HC_bulk <- deg_HC$gene[deg_HC$p_value_sample_level< 0.05]
+```
+
+```{r}
+deg_HC_BG_filter <- deg_HC_BG %>% 
+  # filter(
+  #   p_val_adj_HC < 0.05 & (conflict | p_val_adj_BG > 0.05),
+  #   sign(mean_count_short_PFI_sample_level_HC - mean_count_long_PFI_sample_level_HC) == sign(avg_log2FC_HC),
+  #   sign(mean_count_short_PFI_sample_level_BG - mean_count_long_PFI_sample_level_BG) == sign(avg_log2FC_BG)
+  #   ) %>% 
+  mutate(
+    rank = abs(mean_count_short_PFI_sample_level_HC - mean_count_long_PFI_sample_level_HC)) %>% 
+  arrange(desc(rank))
+deg_HC_BG_filter$sig_in_bulk <- deg_HC_BG_filter$gene %in% sig_gene_in_HC_bulk
+```
+
+```{r}
+write.csv(deg_HC_BG_filter, paste0(sub_output_dir, "merge_and_filter_deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_with_in_BG.csv"),
+          row.names = FALSE)
+```
+
+```{r include=FALSE}
+plot_genes <- c(deg_HC_BG_filter$gene[1:5])
+
+for (g in plot_genes){
+  g_exp <- data@assays$SCT@counts[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(
+    # subset(data, cells = colnames(data)[data$PFI_confidence != "Benign"]),
+    data,
+    slot = "counts", features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_raw_count.png"), figure, height = 7, width = 21)
+}
+
+for (g in plot_genes){
+  g_exp <- data@assays$SCT@data[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(data, features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_normalized.png"), figure, height = 7, width = 21)
+}
+```
+
+### Select the target genes for validation
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "data", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+sub_output_dir <- "../data/output/DEG/select_genes_for_validation/"
+if (!dir.exists(sub_output_dir)) {
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+deg <- read.csv("../data/output/DEG/merge_filter_DEGs/merge_and_filter_deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_with_in_BG.csv") %>% 
+  mutate(
+    HCS_BGS = mean_count_short_PFI_sample_level_HC - mean_count_short_PFI_sample_level_BG,
+    BGS_BGL = mean_count_short_PFI_sample_level_BG - mean_count_long_PFI_sample_level_BG,
+    BGL_HCL = mean_count_long_PFI_sample_level_BG - mean_count_long_PFI_sample_level_HC,
+    HCS_HCL = mean_count_short_PFI_sample_level_HC - mean_count_long_PFI_sample_level_HC
+  )
+write.csv(
+  deg,
+  paste0(sub_output_dir,"merge_and_filter_deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_with_in_BG_add_differences_of_bulk_mean_count.csv"),
+  row.names = FALSE
+)
+```
+
+Genes whose expression: HCS > BGS and BGL > HCL
+
+```{r}
+decrease <- deg %>% 
+  filter(
+    HCS_BGS > 0, BGL_HCL > 0,
+    p_value_sample_level_BG > 0.05,
+    p_value_sample_level_HC < 0.05,
+    p_val_adj_HC < 0.05,
+    BGS_BGL > 0) %>% 
+  arrange(desc(HCS_HCL))
+
+write.csv(
+  decrease,
+  paste0(sub_output_dir, "genes_decrease_in_HCL_compare_to_HCS.csv"),
+  row.names = FALSE)
+```
+
+### Heatmap
+
+```{r}
+decrease <- read.csv(paste0(sub_output_dir, "genes_decrease_in_HCL_compare_to_HCS.csv"))
+increase <- read.csv(paste0(sub_output_dir, "genes_increase_in_HCL_compare_to_HCS.csv"))
+```
+
+```{r}
+plot_table <- decrease %>% 
+  select(
+    HCS_sc = mean_exp_short_PFI_HC,
+    BGS_sc = mean_exp_short_PFI_BG,
+    BGL_sc = mean_exp_long_PFI_BG,
+    HCL_sc = mean_exp_long_PFI_HC,
+    HCS_bulk = mean_count_short_PFI_sample_level_HC, 
+    BGS_bulk = mean_count_short_PFI_sample_level_BG, 
+    BGL_bulk = mean_count_long_PFI_sample_level_BG, 
+    HCL_bulk = mean_count_long_PFI_sample_level_HC
+  )
+rownames(plot_table) <- decrease$gene
+# png(paste0(sub_output_dir, "heatmap_decrease.png"), height = 900, width = 800)
+# heatmap(as.matrix(plot_table),
+#         Colv=NA, Rowv = NA)
+# dev.off()
+
+pdf(paste0(sub_output_dir, "heatmap_decrease.pdf"), height = 10, width = 10)
+heatmap(t(as.matrix(plot_table)),
+        Colv=NA, Rowv = NA, cexRow = 1, cexCol = 1,
+        scale = "column")
+dev.off()
+```
+
+```{r}
+plot_table <- increase %>% 
+  select(
+    HCS_sc = mean_exp_short_PFI_HC,
+    BGS_sc = mean_exp_short_PFI_BG,
+    BGL_sc = mean_exp_long_PFI_BG,
+    HCL_sc = mean_exp_long_PFI_HC,
+    HCS_bulk = mean_count_short_PFI_sample_level_HC, 
+    BGS_bulk = mean_count_short_PFI_sample_level_BG, 
+    BGL_bulk = mean_count_long_PFI_sample_level_BG, 
+    HCL_bulk = mean_count_long_PFI_sample_level_HC
+  )
+rownames(plot_table) <- increase$gene
+
+pdf(paste0(sub_output_dir, "heatmap_increase.pdf"), height = 10, width = 12)
+heatmap(t(as.matrix(plot_table)),
+        Colv=NA, Rowv = NA, cexRow = 1, cexCol = 1,
+        scale = "column")
+dev.off()
+```
+
+# Violin plot
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "data", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+sub_output_dir <- paste0(output_dir, "DEG/validation_gene_plots/")
+if (!dir.exists(sub_output_dir)) {
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+# selected_genes <- decrease$gene[1:10]
+selected_genes <- c("KRT7", "ITGB8", "TACSTD2", "JUN", "GSTP1", "LPAR3", "PPIB", "CCNE1")
+for (g in selected_genes) {
+  figure <- suppressWarnings(PlotGeneExpSpatial(data, slot = "counts", gene = g))
+  ggsave(paste0(sub_output_dir, g, "_raw_count_spatial.pdf"), figure, height = 7, width = 21)
+  
+  g_exp <- GetAssayData(data, slot = "data", assay = "SCT")[rownames(data) == g, ]
+  df <- data.frame(
+    patient = names(g_exp),
+    expression = c(g_exp),
+    group = case_when(
+      data$PFI_confidence == "Short PFI high confidence" ~ "HCS",
+      data$PFI_confidence == "Short PFI background" ~ "BGS",
+      data$PFI_confidence == "Long PFI background" ~ "BGL",
+      data$PFI_confidence == "Long PFI high confidence" ~ "HCL",
+      data$PFI_confidence == "Benign" ~ "Benign"
+    )
+    # group = data$PFI_confidence
+  )
+  df$group <- factor(
+      df$group,
+      # levels = c(
+      #   "Short PFI high confidence", "Short PFI background",
+      #   "Long PFI background", "Long PFI high confidence", "Benign"
+      # )
+      levels = c("HCS", "BGS", "BGL", "HCL", "Benign")
+    )
+  means <- aggregate(expression ~  group, df, mean)
+  # comparisons <- list(
+  #   c("Short PFI high confidence", "Short PFI background"),
+  #   c("Short PFI background", "Long PFI background"),
+  #   c("Long PFI background", "Long PFI high confidence")
+  # )
+  comparisons <- list(
+    c("HCS", "BGS"),
+    c("BGS", "BGL"),
+    c("BGL", "HCL"),
+    c("HCS", "HCL")
+  )
+  df <- filter(df, group != "Benign")
+  p <- ggplot(data = df, aes(x = group, y = expression, fill = group)) +
+    geom_violin(trim = FALSE) + 
+    labs(
+      title = g,
+      x = "",
+      y = "Expression Level") +
+    geom_boxplot(
+      width = 0.1,
+      fill = "white",
+      outlier.shape = NA
+    ) +  
+    scale_fill_manual(
+      values = c(Orange, Yellow, SkyBlue, Blue, Vermillion)
+    ) +
+    ggpubr::stat_compare_means(
+      label = "p.signif",
+      comparisons = comparisons,
+      size = 2,
+      vjust = 0.5,
+      hide.ns = TRUE
+    ) +
+    # scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+    # geom_text(data = means, aes(label = signif(expression, 4), y = expression), 
+    #           nudge_x = 0.35) +
+    theme_classic() + 
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 7),
+      axis.text.x = element_text(
+        size = 6, face = "plain", color = "black",
+        # angle = 30, hjust = 0.5, vjust = 0.6
+      ),
+      axis.text.y = element_text(size = 6, color = "black"),
+      axis.title.y = element_text(size = 7, face = "plain")
+    )
+  ggsave(paste0(sub_output_dir, g, "_normalized_violin.pdf"), p, height = 2, width = 2)
+  
+  # Raw count
+  # g_exp <- GetAssayData(data, slot = "counts", assay = "SCT")[rownames(data) == g, ]
+  # df <- data.frame(
+  #   patient = names(g_exp),
+  #   expression = c(g_exp),
+  #   group = case_when(
+  #     data$PFI_confidence == "Short PFI high confidence" ~ "HCS",
+  #     data$PFI_confidence == "Short PFI background" ~ "BGS",
+  #     data$PFI_confidence == "Long PFI background" ~ "BGL",
+  #     data$PFI_confidence == "Long PFI high confidence" ~ "HCL",
+  #     data$PFI_confidence == "Benign" ~ "Benign"
+  #   )
+  #     
+  # )
+  # df$group <- factor(
+  #     df$group,
+  #     levels = c("HCS", "BGS", "BGL", "HCL", "Benign")
+  #   )
+  # means <- aggregate(expression ~  group, df, mean)
+  # comparisons <- list(
+  #   c("HCS", "BGS"),
+  #   c("BGS", "BGL"),
+  #   c("BGL", "HCL")
+  # )
+  # p <- ggplot(data = df, aes(x = group, y = expression, fill = group)) +
+  #   geom_violin(trim = FALSE) + 
+  #   labs(
+  #     title = g,
+  #     x = "",
+  #     y = "Raw counts") +
+  #   geom_boxplot(
+  #     width = 0.1,
+  #     fill = "white",
+  #     outlier.shape = NA
+  #   ) + 
+  #   ggpubr::stat_compare_means(
+  #     label = "p.signif",
+  #     comparisons = comparisons,
+  #     size = 2
+  #   ) +
+  #   # geom_text(data = means, aes(label = signif(expression, 4), y = expression), 
+  #   #           nudge_x = 0.35) +
+  #   # scale_fill_manual(values=c("#317DF7", "#CC3311")) +
+  #   theme_classic() + 
+  #     theme(
+  #     legend.position = "none",
+  #     plot.title = element_text(hjust = 0.5, size = 7),
+  #     axis.text.x = element_text(
+  #       size = 6, face = "plain", color = "black",
+  #       # angle = 30, hjust = 0.5, vjust = 0.6
+  #     ),
+  #     axis.text.y = element_text(size = 6, color = "black"),
+  #     axis.title.y = element_text(size = 7, face = "plain")
+  #   )
+  # ggsave(paste0(sub_output_dir, g, "_raw_counts_violin.pdf"), p, height = 3, width = 3)
+}
+```
+
+Genes whose expression: HCS < BGS and BGL < HCL
+
+```{r}
+increase <- deg %>% 
+  filter(
+    HCS_BGS < 0, BGL_HCL < 0, HCS_HCL < 0,
+    p_value_sample_level_BG > 0.05, p_value_sample_level_HC < 0.05, p_val_adj_HC < 0.05) %>% 
+  arrange(HCS_HCL)
+
+write.csv(
+  increase,
+  paste0(sub_output_dir, "genes_increase_in_HCL_compare_to_HCS.csv"),
+  row.names = FALSE)
+```
+
+### EOC_C5 signatures
+
+```{r}
+proliferative_DNA_repair <- c(readxl::read_xlsx("../data/raw/EOC_5_pathway_genes.xlsx")[[1]])
+intersect(proliferative_DNA_repair, decrease$gene)
+intersect(proliferative_DNA_repair, increase$gene)
+```
+
+```{r}
+stress_associated <- c("CEBPB", "CEBPD", "FOS", "IL6", "JUN", "JUNB", "MCL1", "MYC", "SOCS3", "ATF3",
+"DUSP1", "EGR1", "FOSB", "CEBPA", "DDIT3", "EGR2", "CDKN1A", "GADD45B", "TNF",
+"HES1", "HBEGF", "BCL6", "NR4A1", "DUSP6", "GADD45G", "ID2", "NFKBIA", "PLK3",
+"SNAI2", "CREB5", "HLA-G", "HIST1H2BC", "HIST1H2BG", "CALML3", "SNAI1")
+intersect(stress_associated, decrease$gene)
+intersect(stress_associated, increase$gene)
+```
+
+```{r}
+c5 <- c("PCNA", "CHEK1", "HMGB2", "BRCA2", "FANCI", "POLD1")
+intersect(c5, decrease$gene)
+intersect(c5, increase$gene)
+```
+
+### EOC_C7 signature
+
+```{r}
+c7 <- c("JUN", "FOS", "IL6", "TNF", "CXCR4", "SNAI1", "VIM", "GADD45B", "MCL1")
+intersect(c7, decrease$gene)
+intersect(c7, increase$gene)
+```
+
+```{r}
+genes <- c("CCNB2", "CENPM", "NUF2", "TPX2", "HIST1H1B", "MCM10", increase$gene[1:10])
+for (g in genes) {
+  figure <- PlotGeneExpSpatial(data, slot = "counts", gene = g)
+  ggsave(paste0(sub_output_dir, g, "_raw_count_spatial.png"), figure, height = 7, width = 21, dpi = 200)
+  
+  g_exp <- GetAssayData(data, slot = "data", assay = "SCT")[rownames(data) == g, ]
+  df <- data.frame(
+    patient = names(g_exp),
+    expression = c(g_exp),
+    group = case_when(
+      data$PFI_confidence == "Short PFI high confidence" ~ "HCS",
+      data$PFI_confidence == "Short PFI background" ~ "BGS",
+      data$PFI_confidence == "Long PFI background" ~ "BGL",
+      data$PFI_confidence == "Long PFI high confidence" ~ "HCL",
+      data$PFI_confidence == "Benign" ~ "Benign"
+    )
+      
+  )
+  df$group <- factor(
+      df$group,
+      levels = c("HCS", "BGS", "BGL", "HCL", "Benign")
+    )
+  means <- aggregate(expression ~  group, df, mean)
+  comparisons <- list(
+    c("HCS", "BGS"),
+    c("BGS", "BGL"),
+    c("BGL", "HCL")
+  )
+  p <- ggplot(data = df, aes(x = group, y = expression, fill = group)) +
+    geom_violin(trim = FALSE) + 
+    labs(
+      title = g,
+      x = "",
+      y = "Expression Level") +
+    geom_boxplot(
+      width = 0.1,
+      fill = "white",
+      outlier.shape = NA
+    ) + 
+    ggpubr::stat_compare_means(comparisons = comparisons) +
+    geom_text(data = means, aes(label = signif(expression, 4), y = expression), 
+              nudge_x = 0.3) +
+    # scale_fill_manual(values=c("#317DF7", "#CC3311")) +
+    theme_classic() + 
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 14, face = "bold")
+    )
+  ggsave(paste0(sub_output_dir, g, "_normalized_violin.png"), p, height = 4, width = 5)
+  
+  # Raw count
+  g_exp <- GetAssayData(data, slot = "counts", assay = "SCT")[rownames(data) == g, ]
+  df <- data.frame(
+    patient = names(g_exp),
+    expression = c(g_exp),
+    group = case_when(
+      data$PFI_confidence == "Short PFI high confidence" ~ "HCS",
+      data$PFI_confidence == "Short PFI background" ~ "BGS",
+      data$PFI_confidence == "Long PFI background" ~ "BGL",
+      data$PFI_confidence == "Long PFI high confidence" ~ "HCL",
+      data$PFI_confidence == "Benign" ~ "Benign"
+    )
+      
+  )
+  df$group <- factor(
+      df$group,
+      levels = c("HCS", "BGS", "BGL", "HCL", "Benign")
+    )
+  means <- aggregate(expression ~  group, df, mean)
+  comparisons <- list(
+    c("HCS", "BGS"),
+    c("BGS", "BGL"),
+    c("BGL", "HCL")
+  )
+  p <- ggplot(data = df, aes(x = group, y = expression, fill = group)) +
+    geom_violin(trim = FALSE) + 
+    labs(
+      title = g,
+      x = "",
+      y = "Raw counts") +
+    geom_boxplot(
+      width = 0.1,
+      fill = "white",
+      outlier.shape = NA
+    ) + 
+    ggpubr::stat_compare_means(comparisons = comparisons) +
+    geom_text(data = means, aes(label = signif(expression, 4), y = expression), 
+              nudge_x = 0.25) +
+    # scale_fill_manual(values=c("#317DF7", "#CC3311")) +
+    theme_classic() + 
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(size = 12, face = "bold"),
+      axis.title.y = element_text(size = 14, face = "bold"),
+      axis.text.y = element_text(size = 10)
+    )
+  ggsave(paste0(sub_output_dir, g, "_raw_counts_violin.png"), p, height = 4, width = 5)
+}
+```
+
+```{r}
+mono_decrease <- deg %>% 
+  filter(HCS_BGS > 0, BGL_HCL > 0, p_value_sample_level_BG > 0.05, p_value_sample_level_HC < 0.05, p_val_adj_HC < 0.05) %>% 
+  arrange(desc(HCS_HCL))
+
+write.csv(
+  mono_decrease,
+  paste0(sub_output_dir, "mono_decrease_genes.csv"),
+  row.names = FALSE)
+for (g in mono_decrease$gene[1:5]) {
+  figure <- PlotGeneExpSpatial(data, slot = "counts", gene = g)
+  ggsave(paste0(sub_output_dir, g, "_raw_count.png"), figure, height = 7, width = 21)
+}
+```
+
+
+# Visualization
+
+## top DEG genes short PFI vs long PFI in HC
+
+```{r}
+sub_output_dir <- "../data/output/cellranger_agg/top_DEG_short_vs_long_in_HC/"
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+deg_HC <- read.csv("../data/output/cellranger_agg/DEG/deg_short_vs_long_PFI_in_HC_add_sample_level_t_test.csv")
+```
+
+```{r include=FALSE}
+gene <- deg_HC %>% 
+  filter(
+    p_val_adj < 0.05,
+    p_value_sample_level < 0.05) %>% 
+  arrange(desc(abs(avg_log2FC))) 
+
+for (g in gene$gene[1:30]){
+  g_exp <- data@assays$SCT@counts[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_raw_count.png"), figure, height = 7, width = 21)
+}
+
+for (g in gene$gene[1:30]){
+  g_exp <- data@assays$SCT@data[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(data, features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_normalized.png"), figure, height = 7, width = 21)
+}
+```
+
+## top DEG genes short PFI vs long PFI in BG
+
+```{r}
+sub_output_dir <- "../data/output/cellranger_agg/top_DEG_short_vs_long_in_BG/"
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+deg_BG <- read.csv("../data/output/cellranger_agg/DEG/deg_short_vs_long_PFI_in_BG_add_sample_level_t_test.csv")
+```
+
+```{r include=FALSE}
+gene <- deg_BG %>% 
+  filter(
+    p_val_adj < 0.05,
+    p_value_sample_level < 0.05) %>% 
+  arrange(desc(abs(avg_log2FC)))
+
+for (g in gene$gene[1:30]){
+  g_exp <- data@assays$SCT@counts[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_raw_count.png"), figure, height = 7, width = 21)
+}
+
+for (g in gene$gene[1:30]){
+  g_exp <- data@assays$SCT@data[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(data, features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_normalized.png"), figure, height = 7, width = 21)
+}
+```
+
+```{r}
+data$annotation_manual[data$annotation_manual == ""] <- NA
+p <- SpatialPlot(data, group.by = "annotation_manual")
+ggsave("../data/output/cellranger_agg/cell_type_mophology.png", p, height = 7, width = 21)
+```
+
+```{r}
+SpatialPlot(data, features = "nCount_Spatial")
+ggsave("../data/output/cellranger_agg/umi_count.png", height = 7, width = 21)
+```
+
+# Gene set analysis
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+gene_set <- c("H", "C2", "C4", "C5", "C6", "C7")
+```
+
+## short PFI vs long PFI in HC area
+
+```{r}
+sub_output_dir <- paste0(output_dir, "GSEA/short_vs_long_PFI_in_HC/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+deg <- read.csv("../data/output/DEG/deg_short_vs_long_PFI_in_HC_add_sample_level_t_test.csv") %>% 
+  select(gene, avg_log2FC_manual, p_val_adj) %>% 
+  group_by(gene) %>% 
+  summarise(
+    avg_log2FC = mean(avg_log2FC_manual),
+    p_val_adj = mean(p_val_adj)
+  )
+ranks<- deg$avg_log2FC
+# ranks[!is.finite(ranks)] <- max(ranks[is.finite(ranks)]) + 1# -log10(10E-300)
+names(ranks) <- deg$gene
+```
+
+```{r}
+for (s in gene_set) {
+  m_df<- msigdbr(species = "Homo sapiens", category = s)
+  fgsea_sets<- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+  fgseaRes <- fgsea(
+    pathways = fgsea_sets,
+    stats = ranks,
+    eps = 0)
+  fgseaRes$leadingEdge <- sapply(fgseaRes$leadingEdge, paste, collapse = "; ")
+  fgseaRes <- fgseaRes %>%
+    arrange(desc(NES))
+  write.csv(
+    fgseaRes,
+    paste0(sub_output_dir, "deg_single_cell_logFC_manual_", s, "_dif.csv"),
+    row.names = FALSE)
+}
+```
+
+## short PFI vs long PFI in BG area
+
+```{r}
+sub_output_dir <- paste0(output_dir, "GSEA/short_vs_long_PFI_in_BG/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+deg <- read.csv("../data/output/DEG/deg_short_vs_long_PFI_in_BG_add_sample_level_t_test.csv") %>% 
+  select(gene, avg_log2FC_manual, p_val_adj) %>% 
+  group_by(gene) %>% 
+  summarise(
+    avg_log2FC = mean(avg_log2FC_manual),
+    p_val_adj = mean(p_val_adj)
+  )
+ranks<- deg$avg_log2FC
+# ranks[!is.finite(ranks)] <- max(ranks[is.finite(ranks)]) + 1# -log10(10E-300)
+names(ranks) <- deg$gene
+```
+
+```{r}
+for (s in gene_set) {
+  m_df<- msigdbr(species = "Homo sapiens", category = s)
+  fgsea_sets<- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+  fgseaRes <- fgsea(
+    pathways = fgsea_sets,
+    stats = ranks,
+    eps = 0)
+  fgseaRes$leadingEdge <- sapply(fgseaRes$leadingEdge, paste, collapse = "; ")
+  fgseaRes <- fgseaRes %>%
+    arrange(desc(NES))
+  write.csv(
+    fgseaRes,
+    paste0(sub_output_dir, "deg_single_cell_logFC_manual_", s, "_dif.csv"),
+    row.names = FALSE)
+}
+```
+
+## Heatmap
+
+```{r}
+sub_output_dir <- paste0(output_dir, "GSEA/Heatmap/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+gsea_HC <- NULL
+for (s in c("H")) {
+  tmp <- read.csv(paste0(output_dir, "GSEA/short_vs_long_PFI_in_HC/deg_single_cell_logFC_manual_", s, "_dif.csv"))
+  if (is.null(gsea_HC)){
+    gsea_HC <- tmp
+  } else {
+    gsea_HC <- rbind.data.frame(gsea_HC, tmp)
+  }
+}
+gsea_HC$group <- "High confidence"
+
+gsea_BG <- NULL
+for (s in c("H")) {
+  tmp <- read.csv(paste0(output_dir, "GSEA/short_vs_long_PFI_in_BG/deg_single_cell_logFC_manual_", s, "_dif.csv"))
+  if (is.null(gsea_BG)){
+    gsea_BG <- tmp
+  } else {
+    gsea_BG <- rbind.data.frame(gsea_BG, tmp)
+  }
+}
+gsea_BG$group <- "Background"
+gsea_merge <- gsea_BG %>% 
+  rbind.data.frame(gsea_HC)
+```
+
+### H Pathway in HC not BG
+
+```{r}
+path_HC_not_BG <- gsea_merge %>% 
+  filter(
+    (group == "High confidence" & padj <= 0.05))
+```
+
+```{r}
+plot_table <- gsea_merge %>% 
+  filter(pathway %in% path_HC_not_BG$pathway)
+plot_table$pathway <- gsub("HALLMARK_", "", plot_table$pathway)
+plot_table$pathway <- gsub("_", " ", plot_table$pathway)
+plot_table$group <- factor(plot_table$group, levels = c("High confidence", "Background"))
+
+p_value <- plot_table$padj
+plot_table <- plot_table %>% 
+  dplyr::mutate(
+    signif = dplyr::case_when(
+      p_value < .05 & p_value >= .01 ~ "*", 
+      p_value < .01 & p_value >= .001 ~ "**", 
+      p_value < .001 & p_value >= .0001 ~ "***", 
+      p_value < .0001 ~ "****",
+      TRUE ~ ""
+    )
+  )
+
+hm.palette <- colorRampPalette(rev(brewer.pal(9, 'RdYlBu')), space='Lab')
+
+ggplot(
+  plot_table,
+  aes(x = group, y = pathway, fill=NES)) + 
+  geom_tile()  +
+  # scale_fill_gradientn(colours = hm.palette(100)) +
+  # scale_fill_gradient2(
+  #   high = Orange,
+  #   low = Blue
+  # ) +
+  scale_fill_gradient2(
+    high = Vermillion,
+    low = Blue,
+    mid = "white"
+  ) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  geom_text(aes(label = signif)) +
+  theme(
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    text = element_text(size = 6, color = "black"),
+    axis.text = element_text(colour = "black", size = 6)
+  )
+  
+ggsave(
+  paste0(sub_output_dir, "short_vs_long_PFI_hallmark_pathway_heatmap.pdf"),
+  width = 4,
+  height = 3)
+  
+```
+
+### C2 Pathway in HC not BG
+
+```{r}
+gsea_HC <- NULL
+for (s in c("C2")) {
+  tmp <- read.csv(paste0(output_dir, "GSEA/short_vs_long_PFI_in_HC/deg_single_cell_logFC_manual_", s, "_dif.csv"))
+  if (is.null(gsea_HC)){
+    gsea_HC <- tmp
+  } else {
+    gsea_HC <- rbind.data.frame(gsea_HC, tmp)
+  }
+}
+gsea_HC$group <- "High confidence"
+
+gsea_BG <- NULL
+for (s in c("C2")) {
+  tmp <- read.csv(paste0(output_dir, "GSEA/short_vs_long_PFI_in_BG/deg_single_cell_logFC_manual_", s, "_dif.csv"))
+  if (is.null(gsea_BG)){
+    gsea_BG <- tmp
+  } else {
+    gsea_BG <- rbind.data.frame(gsea_BG, tmp)
+  }
+}
+gsea_BG$group <- "Background"
+gsea_merge <- gsea_BG %>% 
+  rbind.data.frame(gsea_HC)
+```
+
+
+```{r}
+path_HC_not_BG <- gsea_merge %>% 
+  filter(
+    (group == "High confidence" & padj <= 0.05) |
+      (group == "Background" & padj <= 0.05)
+    )
+write.csv(path_HC_not_BG, paste0(sub_output_dir, "C2_pathways_significant_in_HC.csv"), row.names = FALSE)
+```
+
+#### EOC_C5 related pathways
+
+```{r}
+cell_cycle <- path_HC_not_BG$pathway[grepl("CELL_CYCLE", path_HC_not_BG$pathway)]
+DNA_repair <- path_HC_not_BG$pathway[grepl("DNA_REPAIR", path_HC_not_BG$pathway)]
+HDR <- path_HC_not_BG$pathway[grepl("HOMOLOGOUS_RECOMBINATION", path_HC_not_BG$pathway)]
+fanconi_anemia <- path_HC_not_BG$pathway[grepl("FANCONI", path_HC_not_BG$pathway)]
+C5 <- unique(c(cell_cycle, DNA_repair, HDR, fanconi_anemia))
+```
+
+```{r}
+plot_table <- gsea_merge %>% 
+  filter(pathway %in% C5)
+# plot_table$pathway <- gsub("^[a-z]_", "", plot_table$pathway)
+plot_table$pathway <- gsub("_", " ", plot_table$pathway)
+C5 <- gsub("_", " ", C5)
+
+plot_table$pathway <- factor(plot_table$pathway, levels = C5)
+plot_table$group <- factor(plot_table$group, levels = c("High confidence", "Background"))
+p_value <- plot_table$padj
+plot_table <- plot_table %>% 
+  dplyr::mutate(
+    signif = dplyr::case_when(
+      p_value < .05 & p_value >= .01 ~ "*", 
+      p_value < .01 & p_value >= .001 ~ "**", 
+      p_value < .001 & p_value >= .0001 ~ "***", 
+      p_value < .0001 ~ "****",
+      TRUE ~ ""
+    )
+  )
+
+hm.palette <- colorRampPalette(rev(brewer.pal(9, 'RdYlBu')), space='Lab')
+
+ggplot(
+  plot_table,
+  aes(x = group, y = pathway, fill=NES)) + 
+  geom_tile()  +
+  # scale_fill_gradientn(colours = hm.palette(100)) +
+  # scale_fill_gradient2(
+  #   high = Orange,
+  #   low = Blue
+  # ) +
+  scale_fill_gradient2(
+    high = Vermillion,
+    low = Blue,
+    mid = "white"
+  ) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  geom_text(aes(label = signif)) +
+  theme(
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    text = element_text(size = 6, color = "black"),
+    axis.text = element_text(colour = "black", size = 6)
+  )
+  
+ggsave(
+  paste0(sub_output_dir, "short_vs_long_PFI_EOC_C5_pathway_heatmap.pdf"),
+  width = 6,
+  height = 5)
+  
+```
+
+#### EOC_C7 related pathways
+
+```{r}
+IL6 <- path_HC_not_BG$pathway[grepl("IL6", path_HC_not_BG$pathway)]
+TNF <- path_HC_not_BG$pathway[grepl("TNF", path_HC_not_BG$pathway)]
+stress <- path_HC_not_BG$pathway[grepl("STRESS", path_HC_not_BG$pathway)]
+C7 <- unique(c(IL6, TNF, stress))
+```
+
+```{r}
+plot_table <- gsea_merge %>% 
+  filter(pathway %in% C7)
+# plot_table$pathway <- gsub("^[a-z]_", "", plot_table$pathway)
+plot_table$pathway <- gsub("_", " ", plot_table$pathway)
+C7 <- gsub("_", " ", C7)
+
+plot_table$pathway <- factor(plot_table$pathway, levels = C7)
+plot_table$group <- factor(plot_table$group, levels = c("High confidence", "Background"))
+p_value <- plot_table$padj
+plot_table <- plot_table %>% 
+  dplyr::mutate(
+    signif = dplyr::case_when(
+      p_value < .05 & p_value >= .01 ~ "*", 
+      p_value < .01 & p_value >= .001 ~ "**", 
+      p_value < .001 & p_value >= .0001 ~ "***", 
+      p_value < .0001 ~ "****",
+      TRUE ~ ""
+    )
+  )
+
+hm.palette <- colorRampPalette(rev(brewer.pal(9, 'RdYlBu')), space='Lab')
+
+ggplot(
+  plot_table,
+  aes(x = group, y = pathway, fill=NES)) + 
+  geom_tile()  +
+  # scale_fill_gradientn(colours = hm.palette(100)) +
+  # scale_fill_gradient2(
+  #   high = Orange,
+  #   low = Blue
+  # ) +
+  scale_fill_gradient2(
+    high = Vermillion,
+    low = Blue,
+    mid = "white"
+  ) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  geom_text(aes(label = signif)) +
+  theme(
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    text = element_text(size = 6, color = "black"),
+    axis.text = element_text(colour = "black", size = 6)
+  )
+  
+ggsave(
+  paste0(sub_output_dir, "short_vs_long_PFI_EOC_C7_pathway_heatmap.pdf"),
+  width = 6,
+  height = 3)
+  
+```
+
+#### Others
+
+```{r}
+others <- path_HC_not_BG$pathway[!path_HC_not_BG$pathway %in% c(C5, C7)]
+```
+
+```{r}
+plot_table <- gsea_merge %>% 
+  filter(pathway %in% selected_pathways)
+# plot_table$pathway <- gsub("^[a-z]_", "", plot_table$pathway)
+plot_table$pathway <- gsub("_", " ", plot_table$pathway)
+selected_pathways <- gsub("_", " ", selected_pathways)
+
+plot_table$pathway <- factor(plot_table$pathway, levels = selected_pathways)
+p_value <- plot_table$padj
+plot_table <- plot_table %>% 
+  dplyr::mutate(
+    signif = dplyr::case_when(
+      p_value < .05 & p_value >= .01 ~ "*", 
+      p_value < .01 & p_value >= .001 ~ "**", 
+      p_value < .001 & p_value >= .0001 ~ "***", 
+      p_value < .0001 ~ "****",
+      TRUE ~ ""
+    )
+  )
+
+hm.palette <- colorRampPalette(rev(brewer.pal(9, 'RdYlBu')), space='Lab')
+
+ggplot(
+  plot_table,
+  aes(x = group, y = pathway, fill=NES)) + 
+  geom_tile()  +
+  # scale_fill_gradientn(colours = hm.palette(100)) +
+  # scale_fill_gradient2(
+  #   high = Orange,
+  #   low = Blue
+  # ) +
+  scale_fill_gradient2(
+    high = Vermillion,
+    low = Blue,
+    mid = "white"
+  ) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  geom_text(aes(label = signif)) +
+  theme(
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    text = element_text(size = 6, color = "black"),
+    axis.text = element_text(colour = "black", size = 6)
+  )
+  
+ggsave(
+  paste0(sub_output_dir, "short_vs_long_PFI_EOC_C7_pathway_heatmap.pdf"),
+  width = 7,
+  height = 3)
+  
+```
+
+## Filtered DEGs
+
+```{r}
+increase <- read.csv("../data/output/DEG/select_genes_for_validation/genes_increase_in_HCL_compare_to_HCS.csv")
+decrease <- read.csv("../data/output/DEG/select_genes_for_validation/genes_decrease_in_HCL_compare_to_HCS.csv")
+deg <- rbind.data.frame(increase, decrease)
+ranks<- deg$HCS_HCL
+# ranks[!is.finite(ranks)] <- max(ranks[is.finite(ranks)]) + 1# -log10(10E-300)
+names(ranks) <- deg$gene
+```
+
+```{r}
+for (s in gene_set) {
+  m_df<- msigdbr(species = "Homo sapiens", category = s)
+  fgsea_sets<- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+  fgseaRes <- fgsea(
+    pathways = fgsea_sets,
+    stats = ranks,
+    eps = 0)
+  fgseaRes$leadingEdge <- sapply(fgseaRes$leadingEdge, paste, collapse = "; ")
+  fgseaRes <- fgseaRes %>%
+    arrange(desc(NES))
+  write.csv(
+    fgseaRes,
+    paste0(sub_output_dir, "HCS_HCL_diff_", s, "_dif.csv"),
+    row.names = FALSE)
+}
+```
+
+```{r}
+gsea_sig <- NULL
+for (s in gene_set) {
+  tmp <- read.csv(paste0(sub_output_dir, "HCS_HCL_diff_", s, "_dif.csv")) %>% 
+    filter(pval <= 0.05)
+  if (is.null(gsea_sig)){
+    gsea_sig <- tmp
+  } else {
+    gsea_sig <- rbind.data.frame(gsea_sig, tmp)
+  }
+}
+```
+
+# Prediction: predicting the L/S state using HC/BG cells
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+sub_output_dir <- paste0(output_dir, "prediction/")
+if (!dir.exists(sub_output_dir)) {
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+# data <- readRDS("merged_samples.RDS") # 17677/17943 genes, 9129 cells
+# data <- readRDS("merged_samples_old.RDS") # 17677/17943 genes, 9129 cells
+data <- readRDS("../data/output/merged_samples.RDS")
+
+# data = SCTransform(data, assay = "Spatial", vars.to.regress = "patient", verbose = F) # regress out patient
+# data = SCTransform(data, assay = "Spatial", verbose = F)
+
+data2 = data@assays$SCT@data
+# data2 = data@assays$SCT@scale.data
+
+data2 = data.frame(data2)
+dim(data2)
+```
+
+## quantile normalization
+
+```{r}
+# data2 = normalize.quantiles(as.matrix(data2))
+
+group1 = ifelse(str_detect(data$Sample, "marker"), "benign","cancer") # cancer or benign?
+group2 = ifelse(str_detect(data$Sample, "BG"), "BG", "HC") # BG or HC?
+group2[which(group1 == "benign")] = "benign"
+group3 = ifelse(str_detect(data$Sample, "S_"), "S", "L") # S or L?
+group3[which(group1 == "benign")] = "benign"
+group4 = unlist(lapply(data$Sample, function(x) strsplit(x, "_")[[1]][2])) # patient id
+
+index1 = which(group2 == "HC")
+index2 = which(group2 == "BG")
+
+data_HC = data.frame(t(data2[,index1])) # 4166 cells, X features
+data_BG = data.frame(t(data2[,index2])) # 4090 cells, X features
+
+data_HC = cbind(data_HC, group = as.factor(group3[index1]), patient = as.factor(group4[index1]))
+data_BG = cbind(data_BG, group = as.factor(group3[index2]), patient = as.factor(group4[index2]))
+
+patient = unique(group4)
+lapply(patient, function(x) unique(group2[which(group4==x)])) # OVA38 does not have BG
+patient = patient[patient != "OVA38"]
+```
+
+## GBM
+
+### leave-one-patient-out
+
+```{r}
+res <- NULL
+
+h2o.init()
+for(i in 1:length(patient)){
+  set.seed(123)
+  # cat("\r", i)
+  print(i)
+  # Train model on HC samples
+  print("HC")
+  trainIndex = which(data_HC$patient != patient[i]) # the other patient as training data
+  data_HC_train = data_HC[trainIndex, -dim(data_HC)[2]] # remove the patient id
+  data_HC_train = as.h2o(data_HC_train)
+  # fit_HC = h2o.glm(y = "group", training_frame = data_HC_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_HC = h2o.gbm(y = "group", training_frame = data_HC_train)
+  
+  # Test on bootstrap sample
+  testIndex = which(data_HC$patient == patient[i])
+  data_HC_test = data_HC[testIndex, -dim(data_HC)[2]]
+  data_HC_test = as.h2o(data_HC_test)
+  pred_HC = h2o.predict(fit_HC, data_HC_test)
+  pred = factor(as.vector(pred_HC[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_HC_test$group), levels = c("L","S"))
+
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "HC"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+  # h2o.shutdown(prompt = F)
+  
+  # Train model on BG sample
+  print("BG")
+  trainIndex = which(data_BG$patient != patient[i]) # the other patient as training data  
+  data_BG_train = data_BG[trainIndex, -dim(data_BG)[2]]
+  
+  # h2o.init()
+  data_BG_train = as.h2o(data_BG_train)
+  # fit_BG = h2o.glm(y = "group", training_frame = data_BG_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_BG = h2o.gbm(y = "group", training_frame = data_BG_train)
+  
+  testIndex = which(data_BG$patient == patient[i])
+  data_BG_test = data_BG[testIndex, -dim(data_BG)[2]]
+  data_BG_test = as.h2o(data_BG_test)
+  pred_BG = h2o.predict(fit_BG, data_BG_test)
+  pred = factor(as.vector(pred_BG[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_BG_test[, "group"]), levels = c("L","S"))
+  
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "BG"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+}
+h2o.shutdown(prompt = F)
+
+write.csv(res, paste0(sub_output_dir, "res_gbm_predict_results.csv"))
+# res$PFI = unlist(lapply(patient, function(x) unique(group3[which(group4==x)])[1]))
+# 
+# write.xlsx(res, paste0(sub_output_dir, "res_gbm.xlsx"), rowNames = T)
+```
+
+#### Bootstrap
+
+```{r}
+bootstrap_iter <- 100
+patients <- unique(res$patient)
+res_bootstrap <- NULL
+for (a in c("HC", "BG")){
+  for (p in patients){
+    for (i in seq(bootstrap_iter)){
+      set.seed(i)
+      samp <- res %>% 
+        filter(patient == p & area == a) %>% 
+        slice_sample(prop = 1, replace = TRUE)
+      t <- res %>% 
+        filter(patient == p & area == a)
+      cm <- confusionMatrix(samp$pred, samp$true)
+      
+      tmp <- data.frame(
+        patient = p,
+        area = a,
+        accuracy = unname(cm$overall["Accuracy"])
+      )
+      if (is.null(res_bootstrap)){
+        res_bootstrap <- tmp
+      } else {
+        res_bootstrap <- rbind.data.frame(res_bootstrap, tmp)
+      }
+    }
+  }
+}
+write.csv(res_bootstrap, paste0(sub_output_dir, "res_bootstrap_accuracy_GBM.csv"))
+```
+
+#### Bar plot
+
+```{r}
+plot_table <- res_bootstrap %>% 
+  dplyr::group_by(patient, area) %>% 
+  summarise(
+    mean = mean(accuracy),
+    low_bounder = quantile(accuracy, 0.025),
+    up_bounder = quantile(accuracy, 0.975)
+  )
+plot_table$area <- factor(plot_table$area, levels = c("HC", "BG"))
+PFI <- res %>% 
+  select(patient, PFI = true) %>% 
+  unique()
+plot_table <- plot_table %>% 
+  left_join(PFI, by = "patient")
+rank_patient <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean) %>% 
+  mutate(rank = HC) %>%
+  arrange(desc(rank))
+plot_table$patient <- factor(plot_table$patient, levels = rank_patient$patient)
+
+ggplot(
+  filter(plot_table, PFI == "S"),
+  aes(x = patient, y = mean, fill = area)
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_manual(
+    values = c(Orange, Yellow),
+    labels = c("Short PFI high confidence", "Short PFI background")
+  ) +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_short_PFI.pdf"), width = 4.8, height = 2)
+ggplot(
+ filter(plot_table, PFI == "L"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  scale_fill_manual(
+    values = c(Blue, SkyBlue),
+    labels = c("Long PFI high confidence", "Long PFI background")
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_long_PFI.pdf"), width = 4.8, height = 2)
+```
+
+#### Confidence interval signif per sample
+
+```{r}
+sig <- NULL
+for (s in unique(plot_table$patient)) {
+  tmp_data <- plot_table %>% 
+    filter(patient == s)
+  tmp <- data.frame(
+    patient = s,
+    HC_BG = tmp_data$mean[tmp_data$area == "HC"] - tmp_data$mean[tmp_data$area == "BG"],
+    signif = tmp_data$up_bounder[tmp_data$area == "HC"] < tmp_data$low_bounder[tmp_data$area == "BG"] |
+      tmp_data$up_bounder[tmp_data$area == "BG"] < tmp_data$low_bounder[tmp_data$area == "HC"]
+  )
+  if (!is.null(sig)){
+    sig <- rbind.data.frame(sig, tmp)
+  } else {
+    sig <- tmp
+  }
+}
+sig <- sig %>% 
+  arrange(signif, HC_BG)
+write.csv(sig, paste0(sub_output_dir, "Accuracy_HC_vs_BG_significance_per_sample_GBM.csv"), row.names = FALSE)
+```
+
+#### T test
+
+```{r}
+test_table <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean)
+t.test(
+  x = test_table$BG,
+  y = test_table$HC,
+  paired = TRUE
+  )
+cat("Mean for HC: ", mean(test_table$HC), "\n")
+cat("Mean for BG: ", mean(test_table$BG))
+```
+
+### Proportional sampling
+
+```{r}
+res <- NULL
+accuracy <- NULL
+h2o.init()
+iteration = 10
+for(i in 1:iteration){
+  
+  # cat("\r", i)
+  print(i)
+  # Train model on HC samples
+  print("HC")
+  
+  # Sample 90% 
+  set.seed(i)
+  sample_train <- data_HC %>% 
+    select(patient) %>% 
+    rownames_to_column(var = "spot") %>% 
+    group_by(patient) %>% 
+    slice_sample(prop = 0.7)
+  trainIndex = which(rownames(data_HC) %in% sample_train$spot) # the other patient as training data
+  data_HC_train = data_HC[trainIndex, -dim(data_HC)[2]] # remove the patient id
+  data_HC_train = as.h2o(data_HC_train)
+  # fit_HC = h2o.glm(y = "group", training_frame = data_HC_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_HC = h2o.gbm(y = "group", training_frame = data_HC_train)
+  
+  # Test on other samples
+  testIndex <- which(!rownames(data_HC) %in% sample_train$spot)
+  
+  data_HC_test <- data_HC[testIndex, ]
+  spot <- rownames(data_HC_test)
+  data_HC_test <- data_HC_test[, -dim(data_HC)[2]]
+  data_HC_test = as.h2o(data_HC_test)
+  pred_HC = h2o.predict(fit_HC, data_HC_test)
+  pred = factor(as.vector(pred_HC[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_HC_test$group), levels = c("L","S"))
+
+  tmp <- data.frame(
+    iteration = i,
+    spot = spot,
+    pred = pred,
+    true = true,
+    area = "HC"
+  ) %>% 
+    left_join(
+      data_HC %>% 
+      select(patient) %>% 
+      rownames_to_column(var = "spot"),
+    by = "spot"
+    )
+  
+  tmp_accuracy <- NULL
+  for (p in patient){
+    samp <- tmp %>% 
+      filter(patient == p)
+    cm <- confusionMatrix(samp$pred, samp$true)
+    tmp_tmp_accuracy <- data.frame(
+      iteration = i,
+      patient = p,
+      area = "HC",
+      accuracy = unname(cm$overall["Accuracy"])
+    )
+    
+    if (is.null(tmp_accuracy)) {
+      tmp_accuracy <- tmp_tmp_accuracy
+    } else {
+      tmp_accuracy <- rbind.data.frame(tmp_accuracy, tmp_tmp_accuracy)
+    }
+  }
+  
+  if (is.null(accuracy)) {
+    accuracy <- tmp_accuracy
+  } else {
+    accuracy <- rbind.data.frame(accuracy, tmp_accuracy)
+  }
+    
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+  # h2o.shutdown(prompt = F)
+  
+  # Train model on BG sample
+  print("BG")
+   # Sample 90% 
+  set.seed(i)
+  sample_train <- data_BG %>% 
+    select(patient) %>% 
+    rownames_to_column(var = "spot") %>% 
+    group_by(patient) %>% 
+    slice_sample(prop = 0.7)
+  trainIndex = which(rownames(data_BG) %in% sample_train$spot) # the other patient as training data
+  data_BG_train = data_BG[trainIndex, -dim(data_BG)[2]]
+  data_BG_train = as.h2o(data_BG_train)
+  # fit_BG = h2o.glm(y = "group", training_frame = data_BG_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_BG = h2o.gbm(y = "group", training_frame = data_BG_train)
+  
+  # Test on other samples
+  testIndex <- which(!rownames(data_BG) %in% sample_train$spot)
+  data_BG_test = data_BG[testIndex, -dim(data_BG)[2]]
+  spot <- rownames(data_BG_test)
+  data_BG_test = as.h2o(data_BG_test)
+  pred_BG = h2o.predict(fit_BG, data_BG_test)
+  pred = factor(as.vector(pred_BG[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_BG_test$group), levels = c("L","S"))
+  
+  tmp <- data.frame(
+    iteration = i,
+    spot = spot,
+    pred = pred,
+    true = true,
+    area = "BG"
+  ) %>% 
+    left_join(
+      data_BG %>% 
+      select(patient) %>% 
+      rownames_to_column(var = "spot"),
+    by = "spot"
+    )
+  
+  tmp_accuracy <- NULL
+  for (p in patient){
+    samp <- tmp %>% 
+      filter(patient == p)
+    cm <- confusionMatrix(samp$pred, samp$true)
+    tmp_tmp_accuracy <- data.frame(
+      iteration = i,
+      patient = p,
+      area = "BG",
+      accuracy = unname(cm$overall["Accuracy"])
+    )
+    
+    if (is.null(tmp_accuracy)) {
+      tmp_accuracy <- tmp_tmp_accuracy
+    } else {
+      tmp_accuracy <- rbind.data.frame(tmp_accuracy, tmp_tmp_accuracy)
+    }
+  }
+ 
+  if (is.null(accuracy)) {
+    accuracy <- tmp_accuracy
+  } else {
+    accuracy <- rbind.data.frame(accuracy, tmp_accuracy)
+  }
+  
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+}
+h2o.shutdown(prompt = F)
+
+write.csv(res, paste0(sub_output_dir, "res_gbm_predict_results_sampled_proportionally.csv"))
+
+write.csv(accuracy, paste0(sub_output_dir, "res_gbm_accuracy_sampled_proportionally.csv"))
+# res$PFI = unlist(lapply(patient, function(x) unique(group3[which(group4==x)])[1]))
+# 
+# write.xlsx(res, paste0(sub_output_dir, "res_gbm.xlsx"), rowNames = T)
+```
+
+#### Bar plot
+
+```{r}
+plot_table <- accuracy %>% 
+  dplyr::group_by(patient, area) %>% 
+  summarise(
+    mean = mean(accuracy),
+    low_bounder = quantile(accuracy, 0.025),
+    up_bounder = quantile(accuracy, 0.975),
+    .groups = "keep"
+  )
+plot_table$area <- factor(plot_table$area, levels = c("HC", "BG"))
+PFI <- res %>% 
+  select(patient, PFI = true) %>% 
+  unique()
+plot_table <- plot_table %>% 
+  left_join(PFI, by = "patient")
+rank_patient <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean) %>% 
+  mutate(rank = HC) %>%
+  arrange(desc(rank))
+plot_table$patient <- factor(plot_table$patient, levels = rank_patient$patient)
+
+ggplot(
+  filter(plot_table, PFI == "S"),
+  aes(x = patient, y = mean, fill = area)
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_manual(
+    values = c(Orange, Yellow),
+    labels = c("Short PFI high confidence", "Short PFI background")
+  ) +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "gbm_prediction_accuracy_bar_plot_short_PFI_sampled_proportionally.pdf"), width = 4.8, height = 2)
+ggplot(
+ filter(plot_table, PFI == "L"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  scale_fill_manual(
+    values = c(Blue, SkyBlue),
+    labels = c("Long PFI high confidence", "Long PFI background")
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "gbm_prediction_accuracy_bar_plot_long_PFI_sampled_proportionally.pdf"), width = 4.8, height = 2)
+```
+
+#### Confidence interval signif per sample
+
+```{r}
+sig <- NULL
+for (s in unique(plot_table$patient)) {
+  tmp_data <- plot_table %>% 
+    filter(patient == s)
+  tmp <- data.frame(
+    patient = s,
+    HC_BG = tmp_data$mean[tmp_data$area == "HC"] - tmp_data$mean[tmp_data$area == "BG"],
+    signif = tmp_data$up_bounder[tmp_data$area == "HC"] < tmp_data$low_bounder[tmp_data$area == "BG"] |
+      tmp_data$up_bounder[tmp_data$area == "BG"] < tmp_data$low_bounder[tmp_data$area == "HC"]
+  )
+  if (!is.null(sig)){
+    sig <- rbind.data.frame(sig, tmp)
+  } else {
+    sig <- tmp
+  }
+}
+sig <- sig %>% 
+  arrange(signif, HC_BG)
+write.csv(sig, paste0(sub_output_dir, "Accuracy_HC_vs_BG_significance_per_sample_GBM.csv"), row.names = FALSE)
+```
+
+#### T test
+
+```{r}
+test_table <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean)
+t.test(
+  x = test_table$BG,
+  y = test_table$HC,
+  paired = TRUE
+  )
+cat("Mean for HC: ", mean(test_table$HC), "\n")
+cat("Mean for BG: ", mean(test_table$BG))
+```
+
+## GLM
+
+### leave-one-patient-out
+
+```{r}
+patient = unique(group4)
+lapply(patient, function(x) unique(group2[which(group4==x)])) # OVA38 does not have BG
+patient = patient[patient != "OVA38"]
+res <- NULL
+
+h2o.init()
+for(i in 1:length(patient)){
+  set.seed(123)
+  # cat("\r", i)
+  print(i)
+  # Train model on HC samples
+  print("HC")
+  trainIndex = which(data_HC$patient != patient[i]) # the other patient as training data
+  data_HC_train = data_HC[trainIndex, -dim(data_HC)[2]] # remove the patient id
+  data_HC_train = as.h2o(data_HC_train)
+  fit_HC = h2o.glm(y = "group", training_frame = data_HC_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  # fit_HC = h2o.gbm(y = "group", training_frame = data_HC_train)
+  
+  # Test
+  testIndex = which(data_HC$patient == patient[i])
+  data_HC_test = data_HC[testIndex, -dim(data_HC)[2]]
+  data_HC_test = as.h2o(data_HC_test)
+  pred_HC = h2o.predict(fit_HC, data_HC_test)
+  pred = factor(as.vector(pred_HC[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_HC_test$group), levels = c("L","S"))
+
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "HC"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+  # h2o.shutdown(prompt = F)
+  
+  # Train model on BG sample
+  print("BG")
+  trainIndex = which(data_BG$patient != patient[i]) # the other patient as training data  
+  data_BG_train = data_BG[trainIndex, -dim(data_BG)[2]]
+  
+  # h2o.init()
+  data_BG_train = as.h2o(data_BG_train)
+  fit_BG = h2o.glm(y = "group", training_frame = data_BG_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  # fit_BG = h2o.gbm(y = "group", training_frame = data_BG_train)
+  
+  testIndex = which(data_BG$patient == patient[i])
+  data_BG_test = data_BG[testIndex, -dim(data_BG)[2]]
+  data_BG_test = as.h2o(data_BG_test)
+  pred_BG = h2o.predict(fit_BG, data_BG_test)
+  pred = factor(as.vector(pred_BG[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_BG_test$group), levels = c("L","S"))
+  
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "BG"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+}
+h2o.shutdown(prompt = F)
+
+write.csv(res, paste0(sub_output_dir, "res_gbm_predict_results_GLM.csv"))
+# res$PFI = unlist(lapply(patient, function(x) unique(group3[which(group4==x)])[1]))
+# 
+# write.xlsx(res, paste0(sub_output_dir, "res_gbm.xlsx"), rowNames = T)
+```
+
+### Bootstrap
+
+```{r}
+bootstrap_iter <- 100
+patients <- unique(res$patient)
+res_bootstrap <- NULL
+for (a in c("HC", "BG")){
+  for (p in patients){
+    for (i in seq(bootstrap_iter)){
+      set.seed(i)
+      samp <- res %>% 
+        filter(patient == p & area == a) %>% 
+        slice_sample(prop = 1, replace = TRUE)
+      t <- res %>% 
+        filter(patient == p & area == a)
+      cm <- confusionMatrix(samp$pred, samp$true)
+      
+      tmp <- data.frame(
+        patient = p,
+        area = a,
+        accuracy = unname(cm$overall["Accuracy"])
+      )
+      if (is.null(res_bootstrap)){
+        res_bootstrap <- tmp
+      } else {
+        res_bootstrap <- rbind.data.frame(res_bootstrap, tmp)
+      }
+    }
+  }
+}
+write.csv(res_bootstrap, paste0(sub_output_dir, "res_bootstrap_accuracy_GLM.csv"))
+```
+
+### Bar plot
+
+```{r}
+plot_table <- res_bootstrap %>% 
+  dplyr::group_by(patient, area) %>% 
+  summarise(
+    mean = mean(accuracy),
+    low_bounder = quantile(accuracy, 0.025),
+    up_bounder = quantile(accuracy, 0.975)
+  )
+plot_table$area <- factor(plot_table$area, levels = c("HC", "BG"))
+PFI <- res %>% 
+  select(patient, PFI = true) %>% 
+  unique()
+plot_table <- plot_table %>% 
+  left_join(PFI, by = "patient")
+rank_patient <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean) %>% 
+  mutate(rank = HC) %>%
+  arrange(desc(rank))
+plot_table$patient <- factor(plot_table$patient, levels = rank_patient$patient)
+
+ggplot(
+  filter(plot_table, PFI == "S"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_manual(
+    values = c(Orange, Yellow),
+    labels = c("Short PFI high confidence", "Short PFI background")
+  ) +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_short_PFI_GLM.pdf"), width = 4.8, height = 2)
+ggplot(
+ filter(plot_table, PFI == "L"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  scale_fill_manual(
+    values = c(Blue, SkyBlue),
+    labels = c("Long PFI high confidence", "Long PFI background")
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_long_PFI_GLM.pdf"), width = 4.8, height = 2)
+```
+
+### Confidence interval signif per sample
+
+```{r}
+sig <- NULL
+for (s in unique(plot_table$patient)) {
+  tmp_data <- plot_table %>% 
+    filter(patient == s)
+  tmp <- data.frame(
+    patient = s,
+    HC_BG = tmp_data$mean[tmp_data$area == "HC"] - tmp_data$mean[tmp_data$area == "BG"],
+    signif = tmp_data$up_bounder[tmp_data$area == "HC"] < tmp_data$low_bounder[tmp_data$area == "BG"] |
+      tmp_data$up_bounder[tmp_data$area == "BG"] < tmp_data$low_bounder[tmp_data$area == "HC"]
+  )
+  if (!is.null(sig)){
+    sig <- rbind.data.frame(sig, tmp)
+  } else {
+    sig <- tmp
+  }
+}
+sig <- sig %>% 
+  arrange(signif, HC_BG)
+write.csv(sig, paste0(sub_output_dir, "Accuracy_HC_vs_BG_significance_per_sample_GLM.csv"), row.names = FALSE)
+```
+
+### T test
+
+```{r}
+test_table <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean)
+t.test(
+  x = test_table$BG,
+  y = test_table$HC,
+  paired = TRUE
+  )
+cat("Mean for HC: ", mean(test_table$HC), "\n")
+cat("Mean for BG: ", mean(test_table$BG))
+```
+
+## Deep learning
+
+### leave-one-patient-out
+
+```{r}
+patient = unique(group4)
+lapply(patient, function(x) unique(group2[which(group4==x)])) # OVA38 does not have BG
+patient = patient[patient != "OVA38"]
+res <- NULL
+
+h2o.init()
+for(i in 1:length(patient)){
+  set.seed(123)
+  # cat("\r", i)
+  print(i)
+  # Train model on HC samples
+  print("HC")
+  trainIndex = which(data_HC$patient != patient[i]) # the other patient as training data
+  data_HC_train = data_HC[trainIndex, -dim(data_HC)[2]] # remove the patient id
+  data_HC_train = as.h2o(data_HC_train)
+  # fit_HC = h2o.glm(y = "group", training_frame = data_HC_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_HC = h2o.deeplearning(y = "group", training_frame = data_HC_train)
+  
+  # Test on bootstrap sample
+  testIndex = which(data_HC$patient == patient[i])
+  data_HC_test = data_HC[testIndex, -dim(data_HC)[2]]
+  data_HC_test = as.h2o(data_HC_test)
+  pred_HC = h2o.predict(fit_HC, data_HC_test)
+  pred = factor(as.vector(pred_HC[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_HC_test$group), levels = c("L","S"))
+
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "HC"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+  # h2o.shutdown(prompt = F)
+  
+  # Train model on BG sample
+  print("BG")
+  trainIndex = which(data_BG$patient != patient[i]) # the other patient as training data  
+  data_BG_train = data_BG[trainIndex, -dim(data_BG)[2]]
+  
+  # h2o.init()
+  data_BG_train = as.h2o(data_BG_train)
+  # fit_BG = h2o.glm(y = "group", training_frame = data_BG_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_BG = h2o.deeplearning(y = "group", training_frame = data_BG_train)
+  
+  testIndex = which(data_BG$patient == patient[i])
+  data_BG_test = data_BG[testIndex, -dim(data_BG)[2]]
+  data_BG_test = as.h2o(data_BG_test)
+  pred_BG = h2o.predict(fit_BG, data_BG_test)
+  pred = factor(as.vector(pred_BG[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_BG_test$group), levels = c("L","S"))
+  
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "BG"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+}
+h2o.shutdown(prompt = F)
+
+write.csv(res, paste0(sub_output_dir, "res_gbm_predict_results_deeplearning.csv"))
+# res$PFI = unlist(lapply(patient, function(x) unique(group3[which(group4==x)])[1]))
+# 
+# write.xlsx(res, paste0(sub_output_dir, "res_gbm.xlsx"), rowNames = T)
+```
+
+### Bootstrap
+
+```{r}
+bootstrap_iter <- 100
+patients <- unique(res$patient)
+res_bootstrap <- NULL
+for (a in c("HC", "BG")){
+  for (p in patients){
+    for (i in seq(bootstrap_iter)){
+      set.seed(i)
+      samp <- res %>% 
+        filter(patient == p & area == a) %>% 
+        slice_sample(prop = 1, replace = TRUE)
+      t <- res %>% 
+        filter(patient == p & area == a)
+      cm <- confusionMatrix(samp$pred, samp$true)
+      
+      tmp <- data.frame(
+        patient = p,
+        area = a,
+        accuracy = unname(cm$overall["Accuracy"])
+      )
+      if (is.null(res_bootstrap)){
+        res_bootstrap <- tmp
+      } else {
+        res_bootstrap <- rbind.data.frame(res_bootstrap, tmp)
+      }
+    }
+  }
+}
+write.csv(res_bootstrap, paste0(sub_output_dir, "res_bootstrap_accuracy_deeplearning.csv"))
+```
+
+### Bar plot
+
+```{r}
+plot_table <- res_bootstrap %>% 
+  dplyr::group_by(patient, area) %>% 
+  summarise(
+    mean = mean(accuracy),
+    low_bounder = quantile(accuracy, 0.025),
+    up_bounder = quantile(accuracy, 0.975)
+  )
+plot_table$area <- factor(plot_table$area, levels = c("HC", "BG"))
+PFI <- res %>% 
+  select(patient, PFI = true) %>% 
+  unique()
+plot_table <- plot_table %>% 
+  left_join(PFI, by = "patient")
+rank_patient <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean) %>% 
+  mutate(rank = HC) %>%
+  arrange(desc(rank))
+plot_table$patient <- factor(plot_table$patient, levels = rank_patient$patient)
+
+ggplot(
+  filter(plot_table, PFI == "S"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_manual(
+    values = c(Orange, Yellow),
+    labels = c("Short PFI high confidence", "Short PFI background")
+  ) +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_short_PFI_deeplearning.pdf"), width = 4.8, height = 2)
+ggplot(
+ filter(plot_table, PFI == "L"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  scale_fill_manual(
+    values = c(Blue, SkyBlue),
+    labels = c("Long PFI high confidence", "Long PFI background")
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_long_PFI_deeplearning.pdf"), width = 4.8, height = 2)
+```
+
+### Confidence interval signif per sample
+
+```{r}
+sig <- NULL
+for (s in unique(plot_table$patient)) {
+  tmp_data <- plot_table %>% 
+    filter(patient == s)
+  tmp <- data.frame(
+    patient = s,
+    HC_BG = tmp_data$mean[tmp_data$area == "HC"] - tmp_data$mean[tmp_data$area == "BG"],
+    signif = tmp_data$up_bounder[tmp_data$area == "HC"] < tmp_data$low_bounder[tmp_data$area == "BG"] |
+      tmp_data$up_bounder[tmp_data$area == "BG"] < tmp_data$low_bounder[tmp_data$area == "HC"]
+  )
+  if (!is.null(sig)){
+    sig <- rbind.data.frame(sig, tmp)
+  } else {
+    sig <- tmp
+  }
+}
+sig <- sig %>% 
+  arrange(signif, HC_BG)
+write.csv(sig, paste0(sub_output_dir, "Accuracy_HC_vs_BG_significance_per_sample_deeplearning.csv"), row.names = FALSE)
+```
+
+### T test
+
+```{r}
+test_table <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean)
+t.test(
+  x = test_table$BG,
+  y = test_table$HC,
+  paired = TRUE
+  )
+cat("Mean for HC: ", mean(test_table$HC), "\n")
+cat("Mean for BG: ", mean(test_table$BG))
+```
+
+## random forest
+
+### leave-one-patient-out
+
+```{r}
+patient = unique(group4)
+lapply(patient, function(x) unique(group2[which(group4==x)])) # OVA38 does not have BG
+patient = patient[patient != "OVA38"]
+res <- NULL
+
+h2o.init()
+for(i in 1:length(patient)){
+  set.seed(123)
+  # cat("\r", i)
+  print(i)
+  # Train model on HC samples
+  print("HC")
+  trainIndex = which(data_HC$patient != patient[i]) # the other patient as training data
+  data_HC_train = data_HC[trainIndex, -dim(data_HC)[2]] # remove the patient id
+  data_HC_train = as.h2o(data_HC_train)
+  # fit_HC = h2o.glm(y = "group", training_frame = data_HC_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_HC = h2o.randomForest(y = "group", training_frame = data_HC_train)
+  
+  # Test on bootstrap sample
+  testIndex = which(data_HC$patient == patient[i])
+  data_HC_test = data_HC[testIndex, -dim(data_HC)[2]]
+  data_HC_test = as.h2o(data_HC_test)
+  pred_HC = h2o.predict(fit_HC, data_HC_test)
+  pred = factor(as.vector(pred_HC[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_HC_test$group), levels = c("L","S"))
+
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "HC"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+  # h2o.shutdown(prompt = F)
+  
+  # Train model on BG sample
+  print("BG")
+  trainIndex = which(data_BG$patient != patient[i]) # the other patient as training data  
+  data_BG_train = data_BG[trainIndex, -dim(data_BG)[2]]
+  
+  # h2o.init()
+  data_BG_train = as.h2o(data_BG_train)
+  # fit_BG = h2o.glm(y = "group", training_frame = data_BG_train, family = "binomial", lambda_search = T) # alpha = 0.5 by default
+  fit_BG = h2o.randomForest(y = "group", training_frame = data_BG_train)
+  
+  testIndex = which(data_BG$patient == patient[i])
+  data_BG_test = data_BG[testIndex, -dim(data_BG)[2]]
+  data_BG_test = as.h2o(data_BG_test)
+  pred_BG = h2o.predict(fit_BG, data_BG_test)
+  pred = factor(as.vector(pred_BG[,"predict"]), levels = c("L","S"))
+  true = factor(as.vector(data_BG_test$group), levels = c("L","S"))
+  
+  tmp <- data.frame(
+    patient = patient[i],
+    pred = pred,
+    true = true,
+    area = "BG"
+  )
+  if (is.null(res)) {
+    res <- tmp
+  } else {
+    res <- rbind.data.frame(res, tmp)
+  }
+  h2o.removeAll()
+}
+h2o.shutdown(prompt = F)
+
+write.csv(res, paste0(sub_output_dir, "res_gbm_predict_results_randomForest.csv"))
+# res$PFI = unlist(lapply(patient, function(x) unique(group3[which(group4==x)])[1]))
+# 
+# write.xlsx(res, paste0(sub_output_dir, "res_gbm.xlsx"), rowNames = T)
+```
+
+### Bootstrap
+
+```{r}
+bootstrap_iter <- 100
+patients <- unique(res$patient)
+res_bootstrap <- NULL
+for (a in c("HC", "BG")){
+  for (p in patients){
+    for (i in seq(bootstrap_iter)){
+      set.seed(i)
+      samp <- res %>% 
+        filter(patient == p & area == a) %>% 
+        slice_sample(prop = 1, replace = TRUE)
+      t <- res %>% 
+        filter(patient == p & area == a)
+      cm <- confusionMatrix(samp$pred, samp$true)
+      
+      tmp <- data.frame(
+        patient = p,
+        area = a,
+        accuracy = unname(cm$overall["Accuracy"])
+      )
+      if (is.null(res_bootstrap)){
+        res_bootstrap <- tmp
+      } else {
+        res_bootstrap <- rbind.data.frame(res_bootstrap, tmp)
+      }
+    }
+  }
+}
+write.csv(res_bootstrap, paste0(sub_output_dir, "res_bootstrap_accuracy_randomForest.csv"))
+```
+
+### Bar plot
+
+```{r}
+plot_table <- res_bootstrap %>% 
+  dplyr::group_by(patient, area) %>% 
+  summarise(
+    mean = mean(accuracy),
+    low_bounder = quantile(accuracy, 0.025),
+    up_bounder = quantile(accuracy, 0.975)
+  )
+plot_table$area <- factor(plot_table$area, levels = c("HC", "BG"))
+PFI <- res %>% 
+  select(patient, PFI = true) %>% 
+  unique()
+plot_table <- plot_table %>% 
+  left_join(PFI, by = "patient")
+rank_patient <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean) %>% 
+  mutate(rank = HC) %>%
+  arrange(desc(rank))
+plot_table$patient <- factor(plot_table$patient, levels = rank_patient$patient)
+
+ggplot(
+  filter(plot_table, PFI == "S"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_manual(
+    values = c(Orange, Yellow),
+    labels = c("Short PFI high confidence", "Short PFI background")
+  ) +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_short_PFI_randomForest.pdf"), width = 4.8, height = 2)
+ggplot(
+ filter(plot_table, PFI == "L"),
+  aes(x = patient, y = mean, fill = area, )
+  ) +
+  geom_bar(position="dodge", stat="identity") +
+  geom_errorbar(
+    aes(ymin = low_bounder, ymax = up_bounder),
+    width = 0.2,
+    position=position_dodge(0.9)
+  ) +
+  scale_fill_manual(
+    values = c(Blue, SkyBlue),
+    labels = c("Long PFI high confidence", "Long PFI background")
+  ) +
+  labs(
+    y = "Accuracy",
+    fill = ""
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(color = "black", size = 6),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'cm')
+  )
+ggsave(paste0(sub_output_dir, "prediction_accuracy_bar_plot_long_PFI_randomForest.pdf"), width = 4.8, height = 2)
+```
+
+### Confidence interval signif per sample
+
+```{r}
+sig <- NULL
+for (s in unique(plot_table$patient)) {
+  tmp_data <- plot_table %>% 
+    filter(patient == s)
+  tmp <- data.frame(
+    patient = s,
+    HC_BG = tmp_data$mean[tmp_data$area == "HC"] - tmp_data$mean[tmp_data$area == "BG"],
+    signif = tmp_data$up_bounder[tmp_data$area == "HC"] < tmp_data$low_bounder[tmp_data$area == "BG"] |
+      tmp_data$up_bounder[tmp_data$area == "BG"] < tmp_data$low_bounder[tmp_data$area == "HC"]
+  )
+  if (!is.null(sig)){
+    sig <- rbind.data.frame(sig, tmp)
+  } else {
+    sig <- tmp
+  }
+}
+sig <- sig %>% 
+  arrange(signif, HC_BG)
+write.csv(sig, paste0(sub_output_dir, "Accuracy_HC_vs_BG_significance_per_sample_randomForest.csv"), row.names = FALSE)
+```
+
+### T test
+
+```{r}
+test_table <- plot_table %>% 
+  select(patient, area, mean) %>% 
+  pivot_wider(names_from = area, values_from = mean)
+t.test(
+  x = test_table$BG,
+  y = test_table$HC,
+  paired = TRUE
+  )
+cat("Mean for HC: ", mean(test_table$HC), "\n")
+cat("Mean for BG: ", mean(test_table$BG))
+```
+
+## Why some samples have poor prediction accuracy?
+
+Over all prediction accuracy for each sample
+
+```{r}
+sig_merge <- NULL
+for (m in c("GBM", "GLM", "deeplearning", "randomForest")){
+  tmp <- read.csv(paste0(sub_output_dir, "Accuracy_HC_vs_BG_significance_per_sample_", m, ".csv"))
+  colnames(tmp) <- c(colnames(tmp)[1], paste0(m, "_", colnames(tmp)[2:3]))
+  if (is.null(sig_merge)){
+    sig_merge <- tmp
+  } else {
+    sig_merge <- full_join(sig_merge, tmp, by = "patient")
+  }
+}
+
+sig_merge %>%
+  filter(GBM_HC_BG > 0, GLM_HC_BG > 0, deeplearning_HC_BG > 0, randomForest_HC_BG > 0)
+```
+
+```{r}
+sig_merge %>%
+  filter(GBM_HC_BG < 0, GLM_HC_BG < 0, deeplearning_HC_BG < 0, randomForest_HC_BG < 0)
+```
+
+### Number of sequencing spots
+
+```{r}
+number_of_cells <- table(data$Sample)
+number_of_cells <- as.data.frame(
+  number_of_cells
+  )
+names(number_of_cells) <- c("sample", "n")
+
+number_of_cells$area <- gsub("\\-.*", "", number_of_cells$sample)
+number_of_cells$patient <- gsub(".*\\_", "", number_of_cells$sample)
+
+table <- plot_table %>% 
+  left_join(
+    number_of_cells %>%
+      select(patient, area, n),
+    by = c("patient", "area")
+  )
+cor.test(table$mean, table$n)
+ggplot(table, aes(x = mean, y = n, color = area)) +
+  labs(x = "Prediction accuraty", y = "Number of spot") +
+  geom_point()
+```
+
+### Mean nCounts
+
+```{r}
+n_counts <- data@meta.data %>% 
+  select(Sample, nCount_SCT) %>% 
+  group_by(Sample) %>% 
+  summarise(nCount = mean(nCount_SCT))
+
+n_counts$area <- gsub("\\-.*", "", n_counts$Sample)
+n_counts$patient <- gsub(".*\\_", "", n_counts$Sample)
+
+table <- plot_table %>% 
+  left_join(
+    n_counts %>%
+      select(patient, area, nCount),
+    by = c("patient", "area")
+  )
+cor.test(table$mean, table$nCount)
+ggplot(table, aes(x = mean, y = nCount, color = area)) +
+  labs(x = "Prediction accuraty", y = "UMI count per spot") +
+  geom_point()
+```
+
+### Mean nFeatures
+
+```{r}
+n_features <- data@meta.data %>% 
+  select(Sample, nFeature_SCT) %>% 
+  group_by(Sample) %>% 
+  summarise(nFeature = mean(nFeature_SCT))
+
+n_features$area <- gsub("\\-.*", "", n_features$Sample)
+n_features$patient <- gsub(".*\\_", "", n_features$Sample)
+
+table <- plot_table %>% 
+  left_join(
+    n_features %>%
+      select(patient, area, nFeature),
+    by = c("patient", "area")
+  )
+cor.test(table$mean, table$nFeature)
+ggplot(table, aes(x = mean, y = nFeature, color = area)) +
+  labs(x = "Prediction accuraty", y = "Number of genes per spot") +
+  geom_point()
+```
+
+### Number of tumor cells
+
+```{r}
+n_tumor <- data@meta.data %>% 
+  select(Sample, annotation_manual) %>% 
+  filter(annotation_manual == "Tumor epithelium") %>% 
+  group_by(Sample) %>% 
+  summarise(n_tumor = n())
+
+n_tumor$area <- gsub("\\-.*", "", n_tumor$Sample)
+n_tumor$patient <- gsub(".*\\_", "", n_tumor$Sample)
+
+table <- n_tumor %>% 
+  left_join(
+    number_of_cells,
+    by = c("patient", "area")
+  ) %>% 
+  mutate(prop_tumor = n_tumor/n) %>% 
+  select(patient, area, prop_tumor) %>% 
+  right_join(
+    plot_table,
+    by = c("patient", "area")
+  )
+
+cor.test(table$mean, table$prop_tumor)
+ggplot(table, aes(x = mean, y = prop_tumor, color = area)) +
+  labs(x = "Prediction accuraty", y = "Proportion of tumor epithelium") +
+  geom_point()
+```
+
+## DEG filter out patients with prediction accuracy less than 0.5 in both BG and HC area
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+sub_output_dir <- paste0(output_dir, "DEGs_amples_high_prediction_accuracy/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+### short PFI vs long PFI in BG area
+
+```{r}
+filter_out_samples <- c("OVA20", "OVA26", "OVA6", "OVA10", "OVA28", "OVA38") # OVA38 does not have BG
+data_filtered <- subset(data, cells = colnames(data)[!data$patient %in% filter_out_samples])
+```
+
+```{r}
+data
+unique(data$patient)
+data_filtered
+unique(data_filtered$patient)
+```
+
+```{r include=FALSE}
+Idents(data_filtered) <- "PFI"
+deg_BG <- FindMarkers(
+  subset(data_filtered, cells = colnames(data_filtered)[data_filtered$Confidence == "Background"]), 
+  ident.1 = "Short",
+  ident.2 = "Long",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_short <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Short" & data_filtered$Confidence == "Background"])
+mean_short <- data.frame(
+  gene = names(mean_short),
+  mean_exp_short_PFI = mean_short
+)
+mean_long <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Long" & data_filtered$Confidence == "Background"])
+mean_long <- data.frame(
+  gene = names(mean_long),
+  mean_exp_long_PFI = mean_long
+)
+
+deg_BG <- deg_BG %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_long, by = "gene") %>% 
+  left_join(mean_short, by = "gene")
+
+deg_BG$avg_log2FC_manual <- log2(deg_BG$mean_exp_short_PFI + 1)-log2(deg_BG$mean_exp_long_PFI + 1)
+
+write.csv(
+  deg_BG,
+  paste0(sub_output_dir, "deg_short_vs_long_PFI_in_BG_samples_high_prediction_accuracy.csv"),
+  row.names = FALSE)
+```
+
+## short PFI vs long PFI in HC area
+
+```{r include=FALSE}
+Idents(data_filtered) <- "PFI"
+deg_HC <- FindMarkers(
+  subset(data_filtered, cells = colnames(data_filtered)[data_filtered$Confidence == "High confidence"]), 
+  ident.1 = "Short",
+  ident.2 = "Long",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_short <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Short" & data_filtered$Confidence == "High confidence"])
+mean_short <- data.frame(
+  gene = names(mean_short),
+  mean_exp_short_PFI = mean_short
+)
+mean_long <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Long" & data_filtered$Confidence == "High confidence"])
+mean_long <- data.frame(
+  gene = names(mean_long),
+  mean_exp_long_PFI = mean_long
+)
+
+deg_HC <- deg_HC %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_long, by = "gene") %>% 
+  left_join(mean_short, by = "gene")
+
+deg_HC$avg_log2FC_manual <- log2(deg_HC$mean_exp_short_PFI + 1)-log2(deg_HC$mean_exp_long_PFI + 1)
+
+write.csv(
+  deg_HC,
+  paste0(sub_output_dir, "deg_short_vs_long_PFI_in_HC_samples_high_prediction_accuracy.csv"),
+  row.names = FALSE)
+```
+
+## HC vs BG in Long PFI
+
+```{r include=FALSE}
+Idents(data_filtered) <- "Confidence"
+deg_long <- FindMarkers(
+  subset(data_filtered, cells = colnames(data_filtered)[data_filtered$PFI == "Long"]), 
+  ident.1 = "High confidence",
+  ident.2 = "Background",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_high <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Long" & data_filtered$Confidence == "High confidence"])
+mean_high <- data.frame(
+  gene = names(mean_high),
+  mean_exp_HC = mean_high
+)
+mean_low <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Long" & data_filtered$Confidence == "Background"])
+mean_low <- data.frame(
+  gene = names(mean_low),
+  mean_exp_BC = mean_low
+)
+
+deg_long <- deg_long %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_low, by = "gene") %>% 
+  left_join(mean_high, by = "gene")
+
+deg_long$avg_log2FC_manual <- log2(deg_long$mean_exp_HC + 1)-log2(deg_long$mean_exp_BC + 1)
+
+write.csv(
+  deg_long,
+  paste0(sub_output_dir, "deg_HC_vs_BG_in_long_PFI_samples_high_prediction_accuracy.csv"),
+  row.names = FALSE)
+```
+
+## HC vs BG in Short PFI
+
+```{r include=FALSE}
+Idents(data_filtered) <- "Confidence"
+deg_short <- FindMarkers(
+  subset(data_filtered, cells = colnames(data_filtered)[data_filtered$PFI == "Short"]), 
+  ident.1 = "High confidence",
+  ident.2 = "Background",
+  latent.vars = "patient",
+  logfc.threshold = 0,
+  min.pct = 0.1,
+  test.use = "negbinom"
+  )
+
+mean_high <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Short" & data_filtered$Confidence == "High confidence"])
+mean_high <- data.frame(
+  gene = names(mean_high),
+  mean_exp_HC = mean_high
+)
+mean_low <- rowMeans(data_filtered@assays$SCT@counts[, data_filtered$PFI == "Short" & data_filtered$Confidence == "Background"])
+mean_low <- data.frame(
+  gene = names(mean_low),
+  mean_exp_BG = mean_low
+)
+
+deg_short <- deg_short %>% 
+  rownames_to_column("gene") %>%
+  left_join(mean_low, by = "gene") %>% 
+  left_join(mean_high, by = "gene")
+
+deg_short$avg_log2FC_manual <- log2(deg_short$mean_exp_HC + 1)-log2(deg_short$mean_exp_BG + 1)
+
+write.csv(
+  deg_short,
+  paste0(sub_output_dir, "deg_HC_vs_BG_in_short_PFI_samples_high_prediction_accuracy.csv"),
+  row.names = FALSE)
+```
+
+## Seudo-bulk data across patient cells
+
+```{r}
+exp_matrix <- data_filtered@assays$SCT@data
+exp_count <- data_filtered@assays$SCT@counts
+samples <- unique(data_filtered@meta.data$Sample)
+
+sample_exp_matrix <- data.frame(
+  gene = rownames(exp_matrix)
+)
+sample_exp_count <- data.frame(
+  gene = rownames(exp_count)
+)
+for (s in samples){
+  tmp <- rowMeans(exp_matrix[, colnames(exp_matrix)[data_filtered@meta.data$Sample == s]])
+  sample_exp_matrix[[s]] <- tmp
+  tmp <- rowMeans(exp_count[, colnames(exp_count)[data_filtered@meta.data$Sample == s]])
+  sample_exp_count[[s]] <- tmp
+}
+```
+
+### t test on short PFI vs long PFI in HC area
+
+```{r include=FALSE}
+short <- grepl("HC-S", colnames(sample_exp_matrix))
+long <- grepl("HC-L", colnames(sample_exp_matrix))
+test_result <- NULL
+
+for (i in 1:nrow(sample_exp_matrix)) {
+  t <- t.test(sample_exp_matrix[i, short], sample_exp_matrix[i, long])
+  mean_count_short_PFI_sample_level <- mean(unlist(sample_exp_count[i, short]))
+  mean_count_long_PFI_sample_level <- mean(unlist(sample_exp_count[i, long]))
+  df <- data.frame(
+    gene = sample_exp_matrix$gene[i],
+    p_value_sample_level = t$p.value,
+    mean_count_short_PFI_sample_level = mean_count_short_PFI_sample_level,
+    mean_count_long_PFI_sample_level = mean_count_long_PFI_sample_level
+  )
+  test_result <- rbind.data.frame(test_result, df)
+}
+```
+
+```{r}
+deg_HC <- deg_HC %>% 
+  left_join(test_result, by = "gene")
+```
+
+```{r}
+write.csv(
+  deg_HC,
+  paste0(sub_output_dir, "deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_samples_high_prediction_accuracy.csv"),
+  row.names = FALSE)
+```
+
+### t test on short PFI vs long PFI in BG area
+
+```{r include=FALSE}
+short <- grepl("BG-S", colnames(sample_exp_matrix))
+long <- grepl("BG-L", colnames(sample_exp_matrix))
+test_result <- NULL
+for (i in 1:nrow(sample_exp_matrix)) {
+  t <- t.test(sample_exp_matrix[i, short], sample_exp_matrix[i, long])
+  mean_count_short_PFI_sample_level <- mean(unlist(sample_exp_count[i, short]))
+  mean_count_long_PFI_sample_level <- mean(unlist(sample_exp_count[i, long]))
+  df <- data.frame(
+    gene = sample_exp_matrix$gene[i],
+    p_value_sample_level = t$p.value,
+    mean_count_short_PFI_sample_level = mean_count_short_PFI_sample_level,
+    mean_count_long_PFI_sample_level = mean_count_long_PFI_sample_level
+  )
+  test_result <- rbind.data.frame(test_result, df)
+}
+```
+
+```{r}
+deg_BG <- deg_BG %>% 
+  left_join(test_result, by = "gene")
+```
+
+```{r}
+write.csv(
+  deg_BG,
+  paste0(sub_output_dir, "deg_short_vs_long_PFI_in_BG_add_sample_level_t_test_samples_high_prediction_accuracy.csv"),
+  row.names = FALSE
+)
+```
+
+# Merge DEG lists
+
+## In whole sample
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+sub_output_dir <- paste0(output_dir, "DEGs_samples_high_prediction_accuracy/merge_filter_DEGs/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+deg_HC <- read.csv("../data/output/DEGs_samples_high_prediction_accuracy/deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_samples_high_prediction_accuracy.csv")
+names(deg_HC)[-1] <- paste0(names(deg_HC)[-1], "_HC")
+deg_BG <- read.csv("../data/output/DEGs_samples_high_prediction_accuracy/deg_short_vs_long_PFI_in_BG_add_sample_level_t_test_samples_high_prediction_accuracy.csv")
+names(deg_BG)[-1] <- paste0(names(deg_BG)[-1], "_BG")
+
+deg_HC_BG <- deg_HC %>% 
+  full_join(deg_BG, by = "gene") %>% 
+  mutate(conflict = sign(avg_log2FC_manual_HC) != sign(avg_log2FC_manual_BG))
+
+sig_gene_in_HC_bulk <- deg_HC$gene[deg_HC$p_value_sample_level< 0.05]
+```
+
+```{r}
+deg_HC_BG_filter <- deg_HC_BG %>% 
+  # filter(
+  #   p_val_adj_HC < 0.05 & (conflict | p_val_adj_BG > 0.05),
+  #   sign(mean_count_short_PFI_sample_level_HC - mean_count_long_PFI_sample_level_HC) == sign(avg_log2FC_HC),
+  #   sign(mean_count_short_PFI_sample_level_BG - mean_count_long_PFI_sample_level_BG) == sign(avg_log2FC_BG)
+  #   ) %>% 
+  mutate(
+    rank = abs(mean_count_short_PFI_sample_level_HC - mean_count_long_PFI_sample_level_HC)) %>% 
+  arrange(desc(rank))
+deg_HC_BG_filter$sig_in_bulk <- deg_HC_BG_filter$gene %in% sig_gene_in_HC_bulk
+```
+
+```{r}
+write.csv(deg_HC_BG_filter, paste0(sub_output_dir, "merge_and_filter_deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_with_in_BG_amples_high_prediction_accuracy.csv"),
+          row.names = FALSE)
+```
+
+```{r include=FALSE}
+plot_genes <- c(deg_HC_BG_filter$gene[1:5])
+
+for (g in plot_genes){
+  g_exp <- data@assays$SCT@counts[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(
+    # subset(data, cells = colnames(data)[data$PFI_confidence != "Benign"]),
+    data,
+    slot = "counts", features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, slot = "counts", features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_raw_count.png"), figure, height = 7, width = 21)
+}
+
+for (g in plot_genes){
+  g_exp <- data@assays$SCT@data[rownames(data) == g, ]
+  r <- range(g_exp)
+  myPalette <- colorRampPalette(rev(brewer.pal(11, "Spectral")))
+  p1 <- SpatialPlot(data, features = g, images = "TMA1") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p2 <- SpatialPlot(data, features = g, images = "TMA2") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p3 <- SpatialPlot(data, features = g, images = "TMA3") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  p4 <- SpatialPlot(data, features = g, images = "TMA4") +
+    scale_fill_gradientn(
+      colours = myPalette(100),
+      values=seq(0, 1, length.out=100), limits=r
+    )
+  figure <- ggarrange(p1, p2, p3, p4, 
+                      labels = c("TMA1", "TMA2", "TMA3", "TMA4"),
+                      ncol = 4, nrow = 1)
+  ggsave(paste0(sub_output_dir, g, "_normalized.png"), figure, height = 7, width = 21)
+}
+```
+
+### Select the target genes for validation
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "data", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+sub_output_dir <- paste0(output_dir, "DEGs_samples_high_prediction_accuracy/select_genes_for_validation/")
+if (!dir.exists(sub_output_dir)) {
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+deg <- read.csv("../data/output/DEGs_samples_high_prediction_accuracy/merge_filter_DEGs/merge_and_filter_deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_with_in_BG_amples_high_prediction_accuracy.csv") %>% 
+  mutate(
+    HCS_BGS = mean_count_short_PFI_sample_level_HC - mean_count_short_PFI_sample_level_BG,
+    BGS_BGL = mean_count_short_PFI_sample_level_BG - mean_count_long_PFI_sample_level_BG,
+    BGL_HCL = mean_count_long_PFI_sample_level_BG - mean_count_long_PFI_sample_level_HC,
+    HCS_HCL = mean_count_short_PFI_sample_level_HC - mean_count_long_PFI_sample_level_HC
+  )
+write.csv(
+  deg,
+  paste0(sub_output_dir,"merge_and_filter_deg_short_vs_long_PFI_in_HC_add_sample_level_t_test_with_in_BG_add_differences_of_bulk_mean_count.csv"),
+  row.names = FALSE
+)
+```
+
+Genes whose expression: HCS > BGS and BGL > HCL
+
+```{r}
+decrease <- deg %>% 
+  filter(
+    HCS_BGS > 0, BGL_HCL > 0,
+    p_value_sample_level_BG > 0.05,
+    p_value_sample_level_HC < 0.05,
+    p_val_adj_HC < 0.05,
+    BGS_BGL > 0) %>% 
+  arrange(desc(HCS_HCL))
+
+write.csv(
+  decrease,
+  paste0(sub_output_dir, "genes_decrease_in_HCL_compare_to_HCS.csv"),
+  row.names = FALSE)
+```
+
+Genes whose expression: HCS < BGS and BGL < HCL
+
+```{r}
+increase <- deg %>% 
+  filter(
+    HCS_BGS < 0, BGL_HCL < 0,
+    p_value_sample_level_BG > 0.05,
+    p_value_sample_level_HC < 0.05,
+    p_val_adj_HC < 0.05,
+    BGS_BGL < 0) %>% 
+  arrange(desc(HCS_HCL))
+
+write.csv(
+  increase,
+  paste0(sub_output_dir, "genes_increase_in_HCL_compare_to_HCS.csv"),
+  row.names = FALSE)
+```
+
+### Heatmap
+
+```{r}
+decrease <- read.csv(paste0(sub_output_dir, "genes_decrease_in_HCL_compare_to_HCS.csv"))
+increase <- read.csv(paste0(sub_output_dir, "genes_increase_in_HCL_compare_to_HCS.csv"))
+```
+
+```{r}
+plot_table <- decrease %>% 
+  select(
+    HCS_sc = mean_exp_short_PFI_HC,
+    BGS_sc = mean_exp_short_PFI_BG,
+    BGL_sc = mean_exp_long_PFI_BG,
+    HCL_sc = mean_exp_long_PFI_HC,
+    HCS_bulk = mean_count_short_PFI_sample_level_HC, 
+    BGS_bulk = mean_count_short_PFI_sample_level_BG, 
+    BGL_bulk = mean_count_long_PFI_sample_level_BG, 
+    HCL_bulk = mean_count_long_PFI_sample_level_HC
+  )
+rownames(plot_table) <- decrease$gene
+# png(paste0(sub_output_dir, "heatmap_decrease.png"), height = 900, width = 800)
+# heatmap(as.matrix(plot_table),
+#         Colv=NA, Rowv = NA)
+# dev.off()
+
+pdf(paste0(sub_output_dir, "heatmap_decrease.pdf"), height = 10, width = 10)
+heatmap(t(as.matrix(plot_table)),
+        Colv=NA, Rowv = NA, cexRow = 1, cexCol = 1,
+        scale = "column")
+dev.off()
+```
+
+```{r}
+plot_table <- increase %>% 
+  select(
+    HCS_sc = mean_exp_short_PFI_HC,
+    BGS_sc = mean_exp_short_PFI_BG,
+    BGL_sc = mean_exp_long_PFI_BG,
+    HCL_sc = mean_exp_long_PFI_HC,
+    HCS_bulk = mean_count_short_PFI_sample_level_HC, 
+    BGS_bulk = mean_count_short_PFI_sample_level_BG, 
+    BGL_bulk = mean_count_long_PFI_sample_level_BG, 
+    HCL_bulk = mean_count_long_PFI_sample_level_HC
+  )
+rownames(plot_table) <- increase$gene
+
+pdf(paste0(sub_output_dir, "heatmap_increase.pdf"), height = 10, width = 12)
+heatmap(t(as.matrix(plot_table)),
+        Colv=NA, Rowv = NA, cexRow = 1, cexCol = 1,
+        scale = "column")
+dev.off()
+```
+
+# Cell2location
+
+## C5 C7 abundance
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+sub_output_dir <- paste0(output_dir, "C5_C7_abundance/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+cell_type <- read.csv("../data/raw/merged_visium_obs_with_cell_typse.csv")
+```
+
+Add cell type abundance to seurat object
+
+```{r}
+types <- c(
+  "B.cells", "CAF.1", "CAF.2", "CAF.3", "DC", "EOC_C4", "EOC_C5", "EOC_C7",
+  "EOC_C11", "EOC_Merge", "Macrophages", "Mesothelial", "NK", "Plasma.cells",
+  "T.cells", "pDC")
+for (i in types){
+  meta_tmp <- cell_type[[i]]
+  names(meta_tmp) <- cell_type$Barcode
+  data <- AddMetaData(data, metadata = meta_tmp, col.name = i)
+}
+saveRDS(data, paste0(sub_output_dir, "merged_data_with_cell_type_abundance.RDS"))
+```
+
+```{r}
+plot_cells <- c("EOC_C5", "EOC_C7")
+tmas <- c("TMA1", "TMA2", "TMA3", "TMA4")
+for (plot_cell in plot_cells){
+  for (tma in tmas){
+    # Extract the numbers of gene expression
+    tmp <- data
+    tmp$expression <- factor(signif(unlist(tmp[[plot_cell]]), 2))
+    p_label <- SpatialPlot(tmp, slot = "counts", group.by = "expression", images = tma)#, cols = color)
+    pg <- ggplot_build(p_label)
+    label_data <- pg$data[[1]]
+    label_data[[plot_cell]] <- as.numeric(sapply(label_data$group, function(x){levels(tmp$expression)[x]}))
+    
+    # Color the dots by gene expression
+    p <- SpatialPlot(data, feature = plot_cell, images = tma, alpha = 0.5) +
+      geom_text(data = label_data, mapping = aes_string(x = "x", y = "y", label = plot_cell), size = 1.5)
+    ggsave(paste0(sub_output_dir, plot_cell, "_", tma, ".png"), width = 10, height = 10, plot = p, dpi=300)
+  }
+}
+```
+
+# sample-wise gene expression
+
+# Violin plot
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "data", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+sub_output_dir <- paste0(output_dir, "sample_wise_gene_expression/")
+if (!dir.exists(sub_output_dir)) {
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+# selected_genes <- decrease$gene[1:10]
+selected_genes <- c("KRT7", "ITGB8", "TACSTD2", "JUN", "GSTP1", "LPAR3", "PPIB", "CCNE1")
+for (g in selected_genes) {
+  g_exp <- GetAssayData(data, slot = "data", assay = "SCT")[rownames(data) == g, ]
+  df <- data.frame(
+    patient = data$patient,
+    expression = c(g_exp),
+    group = data$Confidence
+    # group = data$PFI_confidence
+  )
+  df$group <- factor(
+      df$group,
+      levels = c("Benign", "Background", "High confidence")
+    )
+  means <- aggregate(expression ~  group, df, mean)
+  
+  p <- ggplot(data = df, aes(x = patient, y = expression, fill = group)) +
+    # geom_violin(trim = FALSE) + 
+    geom_boxplot() +
+    labs(
+      title = g,
+      x = "",
+      y = "Expression Level") +
+    # geom_boxplot(
+    #   width = 0.1,
+    #   # fill = "white",
+    #   outlier.shape = NA
+    # ) +  
+    scale_fill_manual(
+      values = c(Vermillion, SkyBlue, Blue)#c(Orange, Yellow, SkyBlue, Blue, Vermillion)
+    ) +
+    # ggpubr::stat_compare_means(
+    #   label = "p.signif",
+    #   comparisons = comparisons,
+    #   size = 2,
+    #   vjust = 0.5,
+    #   hide.ns = TRUE
+    # ) +
+    # scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+    # geom_text(data = means, aes(label = signif(expression, 4), y = expression), 
+    #           nudge_x = 0.35) +
+    theme_classic() + 
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, size = 7),
+      axis.text.x = element_blank(), #element_text(
+      #   size = 6, face = "plain", color = "black"#,
+      #   #angle = 90, hjust = 1, vjust = 0.5
+      # ),
+      text = element_text(size = 6),
+      legend.title = element_blank(),
+      axis.text.y = element_text(size = 6, color = "black"),
+      axis.title.y = element_text(size = 7, face = "plain")
+    ) +
+    facet_wrap(~patient, scale="free")
+  ggsave(paste0(sub_output_dir, g, "_normalized_violin.png"), p, height = 6, width = 6)
+}
+```
+# SpatialInferCNV
+
+```{r}
+rm(list = setdiff(ls(), c("output_dir", "PlotGeneExpSpatial", "Blue", "SkyBlue", "Orange", "Yellow", "Vermillion")))
+```
+
+```{r}
+sub_output_dir <- paste0(output_dir, "SpatialInferCNV/")
+if (!dir.exists(sub_output_dir)){
+  dir.create(sub_output_dir)
+}
+```
+
+```{r}
+data <- readRDS("../data/output/merged_samples.RDS")
+gene_ID <- read.table("../data/raw/AGG_OvST_Batch1_251121/filtered_feature_bc_matrix/features.tsv.gz", stringsAsFactors = FALSE) %>% 
+  select(1, 2) %>% 
+  rename(ensembl = V1, symbol = V2)
+gene_ID$symbol[gene_ID$ensembl == "ENSG00000284770"] <- "TBCE.1"
+gene_ID$symbol[gene_ID$ensembl == "ENSG00000187522"] <- "HSPA14.1"
+sub_data <- subset(data, cells = colnames(data)[data$annotation_manual == "Tumor epithelium" | data$PFI == "Benign"])
+```
+
+```{r}
+count <- as.data.frame(sub_data@assays$SCT@counts) %>% 
+  rownames_to_column(var = "symbol") %>% 
+  left_join(gene_ID, by = "symbol") %>% 
+  select(-symbol) %>% 
+  column_to_rownames(var = "ensembl")
+annotation <- sub_data@meta.data %>% 
+  select(PFI_confidence) %>% 
+  rownames_to_column(var = "Barcode")
+
+write.table(count, paste0(sub_output_dir, "visium_counts.tsv"), sep = "\t")
+write.table(
+  annotation, paste0(sub_output_dir, "annotation.tsv"),
+  sep = "\t",
+  quote = FALSE, 
+  col.names = FALSE, 
+  row.names = FALSE
+)
+```
+
+```{r}
+Userguide_10xBreastCancer_infCNV <- infercnv::CreateInfercnvObject(raw_counts_matrix="../data/output/SpatialInferCNV/visium_counts.tsv", 
+                                               gene_order_file="../data/raw/siCNV_GeneOrderFile.tsv",
+                                               annotations_file="../data/output/SpatialInferCNV/annotation.tsv",
+                                               delim="\t",
+                                               ref_group_names="Benign", 
+                                               chr_exclude = c("chrM")) 
+```
+
+```{r}
+Userguide_10xBreastCancer_infCNV = infercnv::run(Userguide_10xBreastCancer_infCNV, 
+                                              cutoff=0.1, #(see infercnv::run documentation)
+                                              out_dir="../data/output/SpatialInferCNV/InferCNVrun_outputs", 
+                                              cluster_by_groups=FALSE, #unsupervised analysis
+                                              analysis_mode='subclusters',
+                                              HMM = FALSE, 
+                                              denoise=TRUE)
+```
+
+```{r}
+sessionInfo()
+```
+
